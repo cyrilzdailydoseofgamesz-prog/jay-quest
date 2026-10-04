@@ -10,8 +10,9 @@ jobs:
       - name: Make ISO
         run: |
           (apk add --no-cache xorriso || (apt-get update && apt-get install -y xorriso))
-          mksfoex -d MEMSIZE=1 -s DISC_ID=JJQE00001 -s DISC_VERSION=1.00 -s CATEGORY=UG "JayJay's Quest" PARAM.SFO
+          mksfoex -d MEMSIZE=1 -s DISC_ID=JJQE00001 -s DISC_VERSION=1.00 -s CATEGORY=UG "JayJay Quest" PARAM.SFO
           mkdir -p iso/PSP_GAME/SYSDIR
+          cp ICON0.PNG iso/PSP_GAME/ICON0.PNG
           cp PARAM.SFO iso/PSP_GAME/PARAM.SFO
           cp JAYJAYQUEST.prx iso/PSP_GAME/SYSDIR/BOOT.BIN
           cp JAYJAYQUEST.prx iso/PSP_GAME/SYSDIR/EBOOT.BIN
