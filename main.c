@@ -1,29 +1,41 @@
-/* JAYJAY'S QUEST: The Sun Shard  -  PSP homebrew (PSPSDK, software rendered)
- * Controls: D-pad / analog = move, CROSS or SQUARE = sword, START = begin/skip
+/* JAYJAY'S QUEST: SUN SHARD RUNNER  -  PSP homebrew, hardware GU 3D
+ *
+ * Race down a neon highway into the sunset. Dodge walls, jump barriers,
+ * grab Sun Shards. Every 10 shards = SUN BURST (+1 life).
+ *
+ * Controls:  LEFT / RIGHT (or analog) = change lane
+ *            CROSS / SQUARE = jump      START = begin / pause / retry
+ *
+ * Needs libs:  -lpspgum -lpspgu -lpspdisplay -lpspge -lpspctrl -lm
  */
 #include <pspkernel.h>
 #include <pspdisplay.h>
 #include <pspctrl.h>
 #include <pspge.h>
-#include <stdint.h>
+#include <pspgu.h>
+#include <pspgum.h>
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 PSP_MODULE_INFO("JAYJAYQUEST", PSP_MODULE_USER, 1, 0);
-PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
+PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
 
 #define SW 480
 #define SH 272
-#define BW 512          /* framebuffer stride in pixels */
-#define T 16
-#define MW 30
-#define MH 17
-#define RGB(r,g,b) (0xFF000000u | ((uint32_t)(b)<<16) | ((uint32_t)(g)<<8) | (uint32_t)(r))
+#define BW 512
+#define FRAME_SIZE (BW * SH * 4)
+#define ZBUF_SIZE  (BW * SH * 2)
 
-enum { TITLE, PLAY, OVER, CREDITS };
+#define RGBA(r,g,b,a) (((uint32_t)(a)<<24)|((uint32_t)(b)<<16)|((uint32_t)(g)<<8)|(uint32_t)(r))
+#define RGB(r,g,b) RGBA(r,g,b,255)
 
-static void *dispbuf[2];
-static uint32_t *drawbuf[2], *back;
-static int cur = 0, frame = 0, state = TITLE, ct = 0;
+typedef struct { uint32_t c; float x, y, z; } V;
+#define F3D (GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
+#define F2D (GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D)
+
+static unsigned int __attribute__((aligned(16))) list[262144];
 
 /* ---------- exit callback (HOME button) ---------- */
 static int exit_cb(int a, int b, void *c) { sceKernelExitGame(); return 0; }
@@ -38,24 +50,104 @@ static void setup_callbacks(void) {
     if (t >= 0) sceKernelStartThread(t, 0, NULL);
 }
 
-/* ---------- drawing ---------- */
-static void rect(int x, int y, int w, int h, uint32_t c) {
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > SW) w = SW - x;
-    if (y + h > SH) h = SH - y;
-    if (w <= 0 || h <= 0) return;
-    uint32_t *p = back + y * BW + x;
-    for (int j = 0; j < h; j++, p += BW)
-        for (int i = 0; i < w; i++) p[i] = c;
+/* ---------- small helpers ---------- */
+static uint32_t rng = 12345;
+static uint32_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
+static int rndi(int n) { return (int)(rnd() % (uint32_t)n); }
+static float rndf(void) { return (rnd() & 0xFFFF) / 65535.0f; }
+
+static uint32_t shade(uint32_t c, float f) {
+    int r = (int)((c & 255) * f), g = (int)(((c >> 8) & 255) * f), b = (int)(((c >> 16) & 255) * f);
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return RGBA(r, g, b, c >> 24);
 }
-static void disc(int cx, int cy, int r, uint32_t c) {
-    for (int j = -r; j <= r; j++) {
-        int w = 0;
-        while ((w + 1) * (w + 1) + j * j <= r * r) w++;
-        if (j * j <= r * r) rect(cx - w, cy + j, 2 * w + 1, 1, c);
+
+/* ---------- 3D drawing ---------- */
+static const unsigned char FC[5][4][3] = {
+    {{0,1,0},{1,1,0},{1,1,1},{0,1,1}},   /* top   */
+    {{0,0,1},{1,0,1},{1,1,1},{0,1,1}},   /* front */
+    {{1,0,0},{0,0,0},{0,1,0},{1,1,0}},   /* back  */
+    {{0,0,0},{0,0,1},{0,1,1},{0,1,0}},   /* left  */
+    {{1,0,1},{1,0,0},{1,1,0},{1,1,1}}    /* right */
+};
+static const float FSHADE[5] = {1.0f, 0.85f, 0.55f, 0.70f, 0.70f};
+
+static void box(float x, float y, float z, float sx, float sy, float sz, uint32_t c) {
+    V *v = (V *)sceGuGetMemory(30 * sizeof(V));
+    float hx = sx * 0.5f, hy = sy * 0.5f, hz = sz * 0.5f;
+    for (int f = 0; f < 5; f++) {
+        V q[4];
+        uint32_t col = shade(c, FSHADE[f]);
+        for (int k = 0; k < 4; k++) {
+            q[k].c = col;
+            q[k].x = FC[f][k][0] ? x + hx : x - hx;
+            q[k].y = FC[f][k][1] ? y + hy : y - hy;
+            q[k].z = FC[f][k][2] ? z + hz : z - hz;
+        }
+        v[f * 6 + 0] = q[0]; v[f * 6 + 1] = q[1]; v[f * 6 + 2] = q[2];
+        v[f * 6 + 3] = q[0]; v[f * 6 + 4] = q[2]; v[f * 6 + 5] = q[3];
     }
+    sceGumDrawArray(GU_TRIANGLES, F3D, 30, 0, v);
 }
+
+/* spinning diamond (octahedron) */
+static void diamond(float x, float y, float z, float ang, float s, uint32_t c) {
+    float ca = cosf(ang), sa = sinf(ang);
+    float bx[6] = {0, 0, s * 0.8f, 0, -s * 0.8f, 0};
+    float by[6] = {s * 1.5f, -s * 1.5f, 0, 0, 0, 0};
+    float bz[6] = {0, 0, 0, s * 0.8f, 0, -s * 0.8f};
+    V p[6];
+    for (int i = 0; i < 6; i++) {
+        p[i].c = c;
+        p[i].x = x + bx[i] * ca + bz[i] * sa;
+        p[i].y = y + by[i];
+        p[i].z = z - bx[i] * sa + bz[i] * ca;
+    }
+    V *v = (V *)sceGuGetMemory(24 * sizeof(V));
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        int a = 2 + i, b = 2 + (i + 1) % 4;
+        uint32_t ct = shade(c, 1.1f - 0.18f * i), cb = shade(c, 0.8f - 0.12f * i);
+        v[n] = p[0]; v[n].c = ct; n++;
+        v[n] = p[a]; v[n].c = ct; n++;
+        v[n] = p[b]; v[n].c = ct; n++;
+        v[n] = p[1]; v[n].c = cb; n++;
+        v[n] = p[b]; v[n].c = cb; n++;
+        v[n] = p[a]; v[n].c = cb; n++;
+    }
+    sceGumDrawArray(GU_TRIANGLES, F3D, 24, 0, v);
+}
+
+/* ---------- 2D drawing ---------- */
+static void fill_rect(float x, float y, float w, float h, uint32_t c) {
+    V *v = (V *)sceGuGetMemory(2 * sizeof(V));
+    v[0].c = c; v[0].x = x;     v[0].y = y;     v[0].z = 0;
+    v[1].c = c; v[1].x = x + w; v[1].y = y + h; v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES, F2D, 2, 0, v);
+}
+static void grad_rect(float x, float y, float w, float h, uint32_t top, uint32_t bot) {
+    V *v = (V *)sceGuGetMemory(6 * sizeof(V));
+    float X[6] = {x, x + w, x + w, x, x + w, x};
+    float Y[6] = {y, y, y + h, y, y + h, y + h};
+    for (int i = 0; i < 6; i++) {
+        v[i].c = (Y[i] > y) ? bot : top; v[i].x = X[i]; v[i].y = Y[i]; v[i].z = 0;
+    }
+    sceGuDrawArray(GU_TRIANGLES, F2D, 6, 0, v);
+}
+static void disc(float cx, float cy, float r, uint32_t cin, uint32_t cout) {
+    const int N = 32;
+    V *v = (V *)sceGuGetMemory((N + 2) * sizeof(V));
+    v[0].c = cin; v[0].x = cx; v[0].y = cy; v[0].z = 0;
+    for (int i = 0; i <= N; i++) {
+        float a = i * 6.2831853f / N;
+        v[i + 1].c = cout; v[i + 1].x = cx + cosf(a) * r; v[i + 1].y = cy + sinf(a) * r; v[i + 1].z = 0;
+    }
+    sceGuDrawArray(GU_TRIANGLE_FAN, F2D, N + 2, 0, v);
+}
+
+/* 5x7 font: letters, digits, a few symbols */
 static const unsigned char FONT[26][7] = {
 {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},{0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},
 {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E},{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
@@ -66,252 +158,429 @@ static const unsigned char FONT[26][7] = {
 {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E},{0x1F,0x04,0x04,0x04,0x04,0x04,0x04},{0x11,0x11,0x11,0x11,0x11,0x11,0x0E},
 {0x11,0x11,0x11,0x11,0x0A,0x0A,0x04},{0x11,0x11,0x11,0x15,0x15,0x1B,0x11},{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
 {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}};
-static void text(int x, int y, const char *s, int sc, uint32_t c) {
-    for (; *s; s++, x += 6 * sc) {
-        if (*s < 'A' || *s > 'Z') continue;
-        const unsigned char *g = FONT[*s - 'A'];
-        for (int r = 0; r < 7; r++)
-            for (int b = 0; b < 5; b++)
-                if (g[r] & (0x10 >> b)) rect(x + b * sc, y + r * sc, sc, sc, c);
+static const unsigned char DIG[10][7] = {
+{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
+{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},{0x1F,0x01,0x02,0x04,0x08,0x08,0x08},{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
+{0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}};
+static const unsigned char SYM[5][7] = {
+{0x00,0x04,0x00,0x00,0x00,0x04,0x00},{0x04,0x04,0x04,0x04,0x04,0x00,0x04},{0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
+{0x00,0x00,0x00,0x00,0x00,0x0C,0x0C},{0x04,0x04,0x08,0x00,0x00,0x00,0x00}};
+
+static const unsigned char *glyph(char c) {
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if (c >= 'A' && c <= 'Z') return FONT[c - 'A'];
+    if (c >= '0' && c <= '9') return DIG[c - '0'];
+    switch (c) {
+        case ':': return SYM[0];
+        case '!': return SYM[1];
+        case '-': return SYM[2];
+        case '.': return SYM[3];
+        case '\'': return SYM[4];
     }
+    return 0;
 }
 static int slen(const char *s) { int n = 0; while (*s++) n++; return n; }
-static void ctext(int y, const char *s, int sc, uint32_t c) { text((SW - slen(s) * 6 * sc) / 2, y, s, sc, c); }
 
-static const char *HEART[6] = {".xx.xx.","xxxxxxx","xxxxxxx",".xxxxx.","..xxx..","...x..."};
-static void heart(int x, int y, uint32_t c) {
+static void text(int x, int y, int sc, uint32_t col, const char *s) {
+    int n = 0;
+    for (const char *p = s; *p; p++) {
+        const unsigned char *g = glyph(*p);
+        if (!g) continue;
+        for (int r = 0; r < 7; r++)
+            for (int b = 0; b < 5; b++)
+                if (g[r] & (0x10 >> b)) n++;
+    }
+    if (n == 0) return;
+    V *v = (V *)sceGuGetMemory(n * 2 * sizeof(V));
+    int k = 0;
+    for (const char *p = s; *p; p++, x += 6 * sc) {
+        const unsigned char *g = glyph(*p);
+        if (!g) continue;
+        for (int r = 0; r < 7; r++)
+            for (int b = 0; b < 5; b++)
+                if (g[r] & (0x10 >> b)) {
+                    v[k].c = col; v[k].x = x + b * sc;        v[k].y = y + r * sc;        v[k].z = 0; k++;
+                    v[k].c = col; v[k].x = x + b * sc + sc;   v[k].y = y + r * sc + sc;   v[k].z = 0; k++;
+                }
+    }
+    sceGuDrawArray(GU_SPRITES, F2D, n * 2, 0, v);
+}
+static void text_s(int x, int y, int sc, uint32_t col, const char *s) {
+    text(x + sc, y + sc, sc, RGBA(0, 0, 0, 190), s);
+    text(x, y, sc, col, s);
+}
+static void ctext(int y, int sc, uint32_t col, const char *s) {
+    text_s((SW - (slen(s) * 6 - 1) * sc) / 2, y, sc, col, s);
+}
+
+static const char *HEART[6] = {".xx.xx.", "xxxxxxx", "xxxxxxx", ".xxxxx.", "..xxx..", "...x..."};
+static void heart(int x, int y, int sc, uint32_t col) {
+    int n = 0;
+    for (int j = 0; j < 6; j++) for (int i = 0; i < 7; i++) if (HEART[j][i] == 'x') n++;
+    V *v = (V *)sceGuGetMemory(n * 2 * sizeof(V));
+    int k = 0;
     for (int j = 0; j < 6; j++)
         for (int i = 0; i < 7; i++)
-            if (HEART[j][i] == 'x') rect(x + i * 2, y + j * 2, 2, 2, c);
-}
-
-/* ---------- world ---------- */
-static unsigned char map[MH][MW];
-static void init_map(void) {
-    for (int y = 0; y < MH; y++)
-        for (int x = 0; x < MW; x++)
-            map[y][x] = (x == 0 || y == 0 || x == MW - 1 || y == MH - 1);
-    for (int y = 1; y < MH - 1; y++) if (y != 7 && y != 8) map[y][14] = 1;
-    static const int tr[][2] = {{4,3},{5,3},{4,4},{9,8},{10,8},{19,3},{20,3},{20,4},{8,12},{9,12},{8,13},
-        {18,10},{19,10},{25,6},{25,7},{22,13},{23,13},{24,13},{5,13}};
-    for (unsigned i = 0; i < sizeof(tr) / sizeof(tr[0]); i++) map[tr[i][1]][tr[i][0]] = 1;
-}
-static int solid(int x, int y) {
-    int tx = x / T, ty = y / T;
-    if (x < 0 || y < 0 || tx >= MW || ty >= MH) return 1;
-    return map[ty][tx];
-}
-static int blocked(int x, int y, int w, int h) {
-    return solid(x, y) || solid(x + w - 1, y) || solid(x, y + h - 1) || solid(x + w - 1, y + h - 1);
-}
-static int ov(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
-    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
-}
-
-typedef struct { int x, y, w, h, hp, dx, dy, t, stun, boss; } E;
-static E en[4];
-static int hx, hy, hp, inv, atk, face, bdead;
-#define SHX 440
-#define SHY 200
-
-static void new_game(void) {
-    hx = 32; hy = 48; hp = 5; inv = 0; atk = 0; face = 2; bdead = 0;
-    static const int sp[3][2] = {{100,60},{300,120},{380,70}};
-    for (int i = 0; i < 3; i++) en[i] = (E){sp[i][0], sp[i][1], 14, 14, 2, 0, 0, 0, 0, 0};
-    en[3] = (E){360, 170, 28, 28, 10, 0, 0, 0, 0, 1};
-    state = PLAY;
-}
-static void sword_rect(int *x, int *y, int *w, int *h) {
-    switch (face) {
-    case 0: *x = hx + 14; *y = hy + 4;  *w = 16; *h = 8;  break;
-    case 1: *x = hx - 14; *y = hy + 4;  *w = 16; *h = 8;  break;
-    case 2: *x = hx + 4;  *y = hy + 14; *w = 8;  *h = 16; break;
-    default:*x = hx + 4;  *y = hy - 14; *w = 8;  *h = 16; break;
-    }
-}
-
-static void update_play(const SceCtrlData *p, unsigned down) {
-    int dx = 0, dy = 0;
-    if ((p->Buttons & PSP_CTRL_LEFT)  || p->Lx < 64)  dx = -1;
-    if ((p->Buttons & PSP_CTRL_RIGHT) || p->Lx > 192) dx = 1;
-    if ((p->Buttons & PSP_CTRL_UP)    || p->Ly < 64)  dy = -1;
-    if ((p->Buttons & PSP_CTRL_DOWN)  || p->Ly > 192) dy = 1;
-    if (dx) face = dx > 0 ? 0 : 1; else if (dy) face = dy > 0 ? 2 : 3;
-    if (atk > 0) atk--; else if (down & (PSP_CTRL_CROSS | PSP_CTRL_SQUARE)) atk = 12;
-    if (inv > 0) inv--;
-    if (dx && !blocked(hx + dx * 2 + 3, hy + 6, 10, 9)) hx += dx * 2;
-    if (dy && !blocked(hx + 3, hy + dy * 2 + 6, 10, 9)) hy += dy * 2;
-
-    int sx, sy, sw, sh; sword_rect(&sx, &sy, &sw, &sh);
-    for (int i = 0; i < 4; i++) {
-        E *e = &en[i];
-        if (e->hp <= 0) continue;
-        if (e->stun) { e->stun--; continue; }
-        if (e->boss) {
-            int s = e->hp <= 4 ? 2 : 1;
-            int ddx = hx > e->x ? 1 : hx < e->x ? -1 : 0;
-            int ddy = hy > e->y ? 1 : hy < e->y ? -1 : 0;
-            for (int k = 0; k < s; k++) {
-                if (ddx && !blocked(e->x + ddx, e->y, e->w, e->h)) e->x += ddx;
-                if (ddy && !blocked(e->x, e->y + ddy, e->w, e->h)) e->y += ddy;
+            if (HEART[j][i] == 'x') {
+                v[k].c = col; v[k].x = x + i * sc;        v[k].y = y + j * sc;        v[k].z = 0; k++;
+                v[k].c = col; v[k].x = x + i * sc + sc;   v[k].y = y + j * sc + sc;   v[k].z = 0; k++;
             }
+    sceGuDrawArray(GU_SPRITES, F2D, n * 2, 0, v);
+}
+
+/* ---------- game state ---------- */
+enum { TITLE, PLAY, OVER };
+enum { K_BARRIER, K_WALL, K_SHARD };
+
+typedef struct { float x, z; int kind, on; } Obj;
+typedef struct { float x, y, z, vx, vy, vz, life, max; uint32_t col; } Part;
+
+#define MAXOBJ 48
+#define MAXPART 96
+static Obj ob[MAXOBJ];
+static Part ps[MAXPART];
+static int pidx = 0;
+
+static const float LANE_X[3] = {-4.5f, 0.0f, 4.5f};
+
+static int state = TITLE, paused = 0;
+static int lane = 1, lives = 3, shards = 0, best = 0;
+static float px = 0, py = 0, vy = 0, speed = 26, dist = 0, score = 0;
+static float inv = 0, shake = 0, tm = 0, spawn_t = 30, overt = 0, msg_t = 0;
+static const char *msg = "";
+
+/* input (edge triggered, filled in main loop) */
+static int in_left, in_right, in_jump, in_start;
+
+static void emit(float x, float y, float z, float vx, float vy, float vz, float life, uint32_t col) {
+    Part *p = &ps[pidx]; pidx = (pidx + 1) % MAXPART;
+    p->x = x; p->y = y; p->z = z; p->vx = vx; p->vy = vy; p->vz = vz;
+    p->life = p->max = life; p->col = col;
+}
+static void burst(float x, float y, float z, int n, uint32_t c1, uint32_t c2) {
+    for (int i = 0; i < n; i++)
+        emit(x, y, z, (rndf() - 0.5f) * 9.0f, rndf() * 8.0f, (rndf() - 0.3f) * 9.0f + speed * 0.5f,
+             0.5f + rndf() * 0.5f, (i & 1) ? c1 : c2);
+}
+
+static void reset_game(void) {
+    for (int i = 0; i < MAXOBJ; i++) ob[i].on = 0;
+    for (int i = 0; i < MAXPART; i++) ps[i].life = 0;
+    lane = 1; px = 0; py = 0; vy = 0; lives = 3; shards = 0; score = 0;
+    speed = 26; dist = 0; inv = 0; shake = 0; spawn_t = 30; paused = 0; msg_t = 0;
+}
+
+static void add_obj(float x, float z, int kind) {
+    for (int i = 0; i < MAXOBJ; i++)
+        if (!ob[i].on) { ob[i].x = x; ob[i].z = z; ob[i].kind = kind; ob[i].on = 1; return; }
+}
+static void spawn_row(void) {
+    int safe = rndi(3);
+    float z = -150.0f;
+    for (int l = 0; l < 3; l++) {
+        if (l == safe) {
+            if (rndi(100) < 75)
+                for (int k = 0; k < 3; k++) add_obj(LANE_X[l], z - k * 4.0f, K_SHARD);
         } else {
-            if (--e->t <= 0) {
-                int d = rand() % 5;
-                e->dx = d == 0 ? 1 : d == 1 ? -1 : 0;
-                e->dy = d == 2 ? 1 : d == 3 ? -1 : 0;
-                e->t = 30 + rand() % 60;
-            }
-            if (frame & 1) {
-                int nx = e->x + e->dx, ny = e->y + e->dy;
-                if (blocked(nx, ny, e->w, e->h)) e->t = 0; else { e->x = nx; e->y = ny; }
-            }
+            int r = rndi(100);
+            if (r < 45) add_obj(LANE_X[l], z, K_WALL);
+            else if (r < 80) add_obj(LANE_X[l], z, K_BARRIER);
         }
-        if (atk > 0 && ov(sx, sy, sw, sh, e->x, e->y, e->w, e->h)) {
-            e->hp--; e->stun = 20;
-            if (e->hp <= 0) { if (e->boss) bdead = 1; continue; }
-        }
-        if (!inv && ov(hx + 3, hy + 3, 10, 12, e->x + 2, e->y + 2, e->w - 4, e->h - 4)) { hp--; inv = 60; }
     }
-    if (hp <= 0) state = OVER;
-    if (bdead && ov(hx, hy, 16, 16, SHX, SHY, 16, 16)) { state = CREDITS; ct = 0; }
 }
 
-/* ---------- sprites ---------- */
-static void draw_hero(void) {
-    if (inv && (inv >> 2) & 1) return;
-    int x = hx, y = hy;
-    rect(x + 3, y + 14, 10, 2, RGB(30,90,30));
-    rect(x + 4, y + 12, 3, 3, RGB(74,48,32)); rect(x + 9, y + 12, 3, 3, RGB(74,48,32));
-    rect(x + 3, y + 7, 10, 6, RGB(47,191,154));
-    rect(x + 3, y + 2, 10, 6, RGB(242,199,155));
-    rect(x + 2, y, 12, 3, RGB(214,58,58));
-    if (face == 2) { rect(x + 5, y + 5, 2, 2, RGB(30,30,30)); rect(x + 9, y + 5, 2, 2, RGB(30,30,30)); }
-    else if (face == 1) rect(x + 4, y + 5, 2, 2, RGB(30,30,30));
-    else if (face == 0) rect(x + 10, y + 5, 2, 2, RGB(30,30,30));
-}
-static void draw_sword(void) {
-    if (atk <= 0) return;
-    int x, y, w, h; sword_rect(&x, &y, &w, &h);
-    rect(x, y, w, h, RGB(232,232,240));
-    if (face < 2) rect(face == 0 ? x : x + w - 2, y - 2, 2, h + 4, RGB(201,162,39));
-    else rect(x - 2, face == 2 ? y : y + h - 2, w + 4, 2, RGB(201,162,39));
-}
-static void draw_slime(const E *e) {
-    int x = e->x - 1, y = e->y - 2; uint32_t c = (e->stun && (e->stun >> 1) & 1) ? RGB(255,255,255) : RGB(123,63,184);
-    rect(x + 3, y + 3, 10, 4, c); rect(x + 1, y + 6, 14, 8, c);
-    rect(x + 1, y + 12, 14, 2, RGB(80,30,130));
-    rect(x + 4, y + 7, 3, 3, RGB(255,255,255)); rect(x + 9, y + 7, 3, 3, RGB(255,255,255));
-    rect(x + 5, y + 8, 1, 2, RGB(0,0,0)); rect(x + 10, y + 8, 1, 2, RGB(0,0,0));
-}
-static void draw_boss(const E *e) {
-    int x = e->x - 2, y = e->y - 2; int fl = e->stun && (e->stun >> 1) & 1;
-    uint32_t red = fl ? RGB(255,255,255) : RGB(190,40,60), dk = fl ? RGB(255,255,255) : RGB(110,15,40);
-    rect(x + 8, y + 26, 4, 6, dk); rect(x + 14, y + 27, 4, 5, dk); rect(x + 22, y + 26, 4, 6, dk);
-    disc(x + 16, y + 18, 11, red); rect(x + 6, y + 22, 21, 4, dk);
-    disc(x + 4, y + 13, 5, red); disc(x + 28, y + 13, 5, red);
-    rect(x + 3, y + 8, 2, 4, RGB(0,0,0)); rect(x + 27, y + 8, 2, 4, RGB(0,0,0));
-    rect(x + 8, y + 3, 3, 7, RGB(255,224,102)); rect(x + 21, y + 3, 3, 7, RGB(255,224,102));
-    disc(x + 11, y + 14, 3, RGB(255,224,102)); disc(x + 21, y + 14, 3, RGB(255,224,102));
-    rect(x + 11, y + 14, 2, 3, RGB(0,0,0)); rect(x + 20, y + 14, 2, 3, RGB(0,0,0));
-    rect(x + 11, y + 21, 10, 2, RGB(0,0,0));
-    for (int i = 11; i < 21; i += 2) rect(x + i, y + 21, 1, 1, RGB(255,255,255));
-}
-static void draw_shard(int x, int y) {
-    int b = (frame / 10) & 1;
-    for (int j = -8; j <= 8; j++) {
-        int w = 8 - (j < 0 ? -j : j);
-        rect(x + 8 - w, y + 8 + j + b, 2 * w + 1, 1, RGB(255,224,102));
-        if (w > 3) rect(x + 8 - w / 2, y + 8 + j + b, w, 1, RGB(255,255,230));
+static void hurt(void) {
+    lives--;
+    inv = 1.6f; shake = 1.0f;
+    burst(px, py + 0.8f, 0, 22, RGB(255, 80, 40), RGB(255, 220, 90));
+    if (lives <= 0) {
+        state = OVER; overt = 0;
+        if ((int)score + shards * 25 > best) best = (int)score + shards * 25;
     }
 }
+
+static void update(float dt) {
+    tm += dt;
+
+    /* particles always */
+    if (!paused) {
+        for (int i = 0; i < MAXPART; i++) {
+            Part *p = &ps[i];
+            if (p->life <= 0) continue;
+            p->life -= dt;
+            p->x += p->vx * dt; p->y += p->vy * dt; p->z += p->vz * dt;
+            p->vy -= 14.0f * dt;
+            if (p->y < 0) { p->y = 0; p->vy *= -0.4f; }
+        }
+        if (shake > 0) shake -= dt * 1.8f;
+        if (msg_t > 0) msg_t -= dt;
+    }
+
+    if (state == TITLE) {
+        dist += 22.0f * dt;
+        if (in_start) { reset_game(); state = PLAY; }
+        return;
+    }
+    if (state == OVER) {
+        overt += dt;
+        if (in_start && overt > 0.6f) { reset_game(); state = PLAY; }
+        return;
+    }
+
+    /* ---- PLAY ---- */
+    if (in_start) paused = !paused;
+    if (paused) return;
+
+    if (in_left && lane > 0) lane--;
+    if (in_right && lane < 2) lane++;
+    px += (LANE_X[lane] - px) * (dt * 13.0f > 1.0f ? 1.0f : dt * 13.0f);
+
+    if (in_jump && py <= 0.001f) vy = 15.5f;
+    vy -= 40.0f * dt;
+    py += vy * dt;
+    if (py <= 0) { py = 0; if (vy < 0) vy = 0; }
+
+    if (speed < 62.0f) speed += dt * 0.45f;
+    dist += speed * dt;
+    score += speed * dt * 0.5f;
+    if (inv > 0) inv -= dt;
+
+    spawn_t -= speed * dt;
+    if (spawn_t <= 0) { spawn_row(); spawn_t = 30.0f + rndi(14); }
+
+    /* engine trail */
+    emit(px + (rndf() - 0.5f) * 0.5f, py + 0.5f, 1.3f, 0, rndf() * 1.5f, speed * 0.8f, 0.35f,
+         (rnd() & 1) ? RGB(255, 140, 40) : RGB(255, 230, 120));
+
+    for (int i = 0; i < MAXOBJ; i++) {
+        Obj *o = &ob[i];
+        if (!o->on) continue;
+        o->z += speed * dt;
+        if (o->z > 14.0f) { o->on = 0; continue; }
+        if (fabsf(o->z) < 1.9f && fabsf(o->x - px) < 2.3f) {
+            if (o->kind == K_SHARD) {
+                if (py < 3.2f) {
+                    o->on = 0; shards++;
+                    burst(o->x, 1.6f, o->z, 12, RGB(255, 235, 110), RGB(255, 255, 255));
+                    if (shards % 10 == 0) {
+                        if (lives < 5) lives++;
+                        score += 500; msg = "SUN BURST!  +1 LIFE"; msg_t = 1.8f;
+                        burst(px, 1.0f, 0, 40, RGB(255, 200, 40), RGB(255, 120, 60));
+                    }
+                }
+            } else if (inv <= 0) {
+                int hit = (o->kind == K_WALL) || (py < 1.25f);
+                if (hit) { o->on = 0; hurt(); if (state == OVER) return; }
+            }
+        }
+    }
+}
+
+/* ---------- rendering ---------- */
+static void draw_sky(void) {
+    const float HZ = 114.0f;
+    grad_rect(0, 0, SW, HZ, RGB(14, 6, 48), RGB(255, 96, 92));
+    /* stars */
+    {
+        V *v = (V *)sceGuGetMemory(2 * 36 * sizeof(V));
+        for (int i = 0; i < 36; i++) {
+            float x = (float)((((uint32_t)i * 2654435761u) >> 16) % SW), y = (float)((((uint32_t)i * 2246822519u + 977u) >> 16) % 95);
+            int a = 120 + (int)(120 * (0.5f + 0.5f * sinf(tm * 2.0f + i)));
+            uint32_t c = RGBA(255, 255, 255, a);
+            v[i * 2].c = c;     v[i * 2].x = x;         v[i * 2].y = y;         v[i * 2].z = 0;
+            v[i * 2 + 1].c = c; v[i * 2 + 1].x = x + 2; v[i * 2 + 1].y = y + 2; v[i * 2 + 1].z = 0;
+        }
+        sceGuDrawArray(GU_SPRITES, F2D, 72, 0, v);
+    }
+    disc(240, 100, 58, RGB(255, 245, 160), RGB(255, 120, 70));
+    /* ground below horizon */
+    grad_rect(0, HZ, SW, SH - HZ, RGB(255, 96, 92), RGB(30, 12, 50));
+}
+
 static void draw_world(void) {
-    for (int ty = 0; ty < MH; ty++)
-        for (int tx = 0; tx < MW; tx++) {
-            int x = tx * T, y = ty * T;
-            rect(x, y, T, T, ((tx + ty) & 1) ? RGB(88,169,68) : RGB(79,154,60));
-            if ((tx * 7 + ty * 13) % 5 == 0) { rect(x + 4, y + 5, 2, 2, RGB(115,196,92)); rect(x + 10, y + 11, 2, 2, RGB(115,196,92)); }
-            if (map[ty][tx]) {
-                rect(x + 6, y + 10, 4, 6, RGB(107,68,35));
-                rect(x + 1, y + 1, 14, 11, RGB(31,90,43)); rect(x + 3, y + 2, 10, 7, RGB(47,125,58)); rect(x + 4, y + 3, 3, 2, RGB(74,163,82));
-            }
+    ScePspFVector3 eye, ctr, up = {0, 1, 0};
+    float sx = sinf(tm * 90.0f) * shake * 0.25f, sy = cosf(tm * 77.0f) * shake * 0.25f;
+    eye.x = px * 0.55f + sx; eye.y = 4.2f + sy; eye.z = 8.5f;
+    ctr.x = px * 0.40f;      ctr.y = 1.0f;      ctr.z = -20.0f;
+
+    sceGumMatrixMode(GU_PROJECTION); sceGumLoadIdentity();
+    sceGumPerspective(70.0f, 16.0f / 9.0f, 0.5f, 400.0f);
+    sceGumMatrixMode(GU_VIEW); sceGumLoadIdentity();
+    sceGumLookAt(&eye, &ctr, &up);
+    sceGumMatrixMode(GU_MODEL); sceGumLoadIdentity();
+
+    /* road + neon rails */
+    box(0, -0.3f, -80, 14.4f, 0.6f, 200, RGB(38, 28, 64));
+    box(-7.4f, 0.25f, -80, 0.4f, 0.5f, 200, RGB(255, 60, 160));
+    box( 7.4f, 0.25f, -80, 0.4f, 0.5f, 200, RGB(40, 220, 255));
+
+    /* lane dashes (scroll with distance) */
+    float off = fmodf(dist, 12.0f);
+    for (int i = 0; i < 15; i++) {
+        float z = -i * 12.0f + off;
+        box(-2.25f, 0.0f, z, 0.3f, 0.1f, 5.0f, RGB(210, 210, 240));
+        box( 2.25f, 0.0f, z, 0.3f, 0.1f, 5.0f, RGB(210, 210, 240));
+    }
+
+    /* crystal towers on both sides */
+    float off2 = fmodf(dist, 16.0f);
+    int base = (int)(dist / 16.0f);
+    for (int i = 0; i < 12; i++) {
+        float z = -i * 16.0f + off2;
+        int id = i + base;
+        for (int s = -1; s <= 1; s += 2) {
+            float h = 2.5f + (float)(((id * 37 + (s + 1) * 11) & 7));
+            float x = s * (11.5f + (float)((id * 13 + s) & 3));
+            uint32_t c = ((id + (s > 0)) & 1) ? RGB(40, 200, 230) : RGB(230, 60, 200);
+            box(x, h * 0.5f, z, 2.4f, h, 2.4f, c);
+            box(x, h + 0.15f, z, 2.6f, 0.3f, 2.6f, shade(c, 1.4f));
         }
-    if (bdead) draw_shard(SHX, SHY);
-    for (int i = 0; i < 3; i++) if (en[i].hp > 0) draw_slime(&en[i]);
-    if (en[3].hp > 0) draw_boss(&en[3]);
-    draw_hero(); draw_sword();
-    for (int i = 0; i < 5; i++) heart(8 + i * 18, 3, i < hp ? RGB(255,68,102) : RGB(74,36,56));
-    if (en[3].hp > 0) { rect(180, 4, 120, 8, RGB(0,0,0)); rect(182, 6, 116 * en[3].hp / 10, 4, RGB(255,68,102)); }
+    }
+
+    /* obstacles + shards */
+    for (int i = 0; i < MAXOBJ; i++) {
+        Obj *o = &ob[i];
+        if (!o->on) continue;
+        if (o->kind == K_BARRIER) {
+            box(o->x, 0.6f, o->z, 3.6f, 1.2f, 1.2f, RGB(255, 140, 30));
+            box(o->x, 1.0f, o->z, 3.7f, 0.25f, 1.3f, RGB(255, 245, 200));
+        } else if (o->kind == K_WALL) {
+            box(o->x, 1.8f, o->z, 3.8f, 3.6f, 1.6f, RGB(150, 40, 190));
+            box(o->x, 3.7f, o->z, 4.0f, 0.25f, 1.8f, RGB(255, 80, 220));
+        } else {
+            diamond(o->x, 1.7f + sinf(tm * 4.0f + o->z) * 0.25f, o->z, tm * 3.0f, 0.55f, RGB(255, 215, 60));
+        }
+    }
+
+    /* player ship */
+    box(px, 0.02f, 0, 1.9f - py * 0.1f, 0.04f, 2.6f, RGB(12, 8, 26));
+    if (!(inv > 0 && ((int)(inv * 14) & 1))) {
+        float lean = (LANE_X[lane] - px) * 0.08f;
+        box(px, py + 0.55f, 0, 1.5f, 0.7f, 2.2f, RGB(40, 180, 255));
+        box(px, py + 1.05f, -0.2f, 0.9f, 0.5f, 1.0f, RGB(235, 250, 255));
+        box(px - 1.0f + lean, py + 0.45f, 0.3f, 0.6f, 0.25f, 1.4f, RGB(255, 200, 60));
+        box(px + 1.0f + lean, py + 0.45f, 0.3f, 0.6f, 0.25f, 1.4f, RGB(255, 200, 60));
+        float g = 0.5f + 0.5f * sinf(tm * 40.0f);
+        box(px, py + 0.5f, 1.25f, 0.8f, 0.4f, 0.3f, RGB(255, (int)(120 + 100 * g), 40));
+    }
+
+    /* particles */
+    for (int i = 0; i < MAXPART; i++) {
+        Part *p = &ps[i];
+        if (p->life <= 0) continue;
+        float s = 0.08f + 0.32f * (p->life / p->max);
+        box(p->x, p->y, p->z, s, s, s, p->col);
+    }
 }
 
-/* ---------- screens ---------- */
-static const char *CR[] = {"THE SUN SHARD","","A GAME BY","JAYJAY","","GAME DESIGN","JAYJAY","","PROGRAMMING","JAYJAY",
-    "","PIXEL ART","JAYJAY","","SOUND","JAYJAY","","THANKS FOR PLAYING","","THE END"};
-#define NCR ((int)(sizeof(CR) / sizeof(CR[0])))
-static void sky(void) {
-    rect(0, 0, SW, SH, RGB(27,20,64));
-    for (int i = 0; i < 60; i++) {
-        int x = (i * 97) % SW, y = (i * 53) % SH;
-        rect(x, y, 1 + (i % 3 > 1), 1 + (i % 3 > 1), ((frame + x) % 60 < 30) ? RGB(255,255,255) : RGB(154,143,216));
+static void draw_hud(void) {
+    char buf[40];
+    fill_rect(0, 0, SW, 40, RGBA(0, 0, 0, 110));
+    snprintf(buf, sizeof buf, "SCORE %06d", (int)score + shards * 25);
+    text_s(8, 5, 2, RGB(255, 255, 255), buf);
+    snprintf(buf, sizeof buf, "SHARDS %02d", shards);
+    text_s(190, 5, 2, RGB(255, 215, 60), buf);
+    for (int i = 0; i < lives; i++) heart(SW - 14 - 18 * (i + 1) + 4, 6, 2, RGB(255, 70, 90));
+    /* sun charge bar */
+    fill_rect(8, 25, 104, 10, RGBA(255, 255, 255, 120));
+    fill_rect(9, 26, 102, 8, RGBA(20, 10, 40, 220));
+    fill_rect(9, 26, (shards % 10) * 10.2f, 8, RGB(255, 200, 40));
+    text_s(120, 26, 1, RGB(255, 235, 150), "SUN CHARGE");
+    if (msg_t > 0) ctext(70, 3, RGB(255, 235, 120), msg);
+}
+
+static void render(void) {
+    sceGuStart(GU_DIRECT, list);
+    sceGuClearColor(RGB(14, 6, 48));
+    sceGuClearDepth(0);
+    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+
+    sceGuDisable(GU_DEPTH_TEST); sceGuDisable(GU_FOG);
+    draw_sky();
+
+    sceGuEnable(GU_DEPTH_TEST); sceGuEnable(GU_FOG);
+    draw_world();
+
+    sceGuDisable(GU_DEPTH_TEST); sceGuDisable(GU_FOG);
+    if (state == PLAY || state == OVER) draw_hud();
+
+    if (state == TITLE) {
+        ctext(26, 2, RGB(255, 215, 60), "JAYJAY'S QUEST");
+        ctext(52, 5, RGB(255, 255, 255), "SUN SHARD");
+        ctext(96, 5, RGB(80, 230, 255), "RUNNER");
+        if (((int)(tm * 2.0f)) & 1) ctext(176, 2, RGB(255, 255, 255), "PRESS START");
+        ctext(212, 1, RGB(255, 220, 160), "LEFT RIGHT OR STICK: CHANGE LANE   X: JUMP");
+        ctext(226, 1, RGB(255, 220, 160), "GRAB SHARDS - 10 SHARDS = EXTRA LIFE");
+    } else if (state == OVER) {
+        fill_rect(0, 60, SW, 150, RGBA(0, 0, 0, 160));
+        char buf[40];
+        ctext(72, 5, RGB(255, 90, 90), "GAME OVER");
+        snprintf(buf, sizeof buf, "SCORE %d", (int)score + shards * 25);
+        ctext(126, 2, RGB(255, 255, 255), buf);
+        snprintf(buf, sizeof buf, "BEST %d", best);
+        ctext(150, 2, RGB(255, 215, 60), buf);
+        if (((int)(tm * 2.0f)) & 1) ctext(180, 2, RGB(255, 255, 255), "PRESS START");
+    } else if (paused) {
+        fill_rect(0, 90, SW, 80, RGBA(0, 0, 0, 150));
+        ctext(105, 5, RGB(255, 255, 255), "PAUSED");
+        ctext(150, 1, RGB(255, 220, 160), "PRESS START TO RESUME");
     }
+
+    sceGuFinish();
+    sceGuSync(0, 0);
+}
+
+static void gfx_init(void) {
+    sceGuInit();
+    sceGuStart(GU_DIRECT, list);
+    sceGuDrawBuffer(GU_PSM_8888, (void *)0, BW);
+    sceGuDispBuffer(SW, SH, (void *)FRAME_SIZE, BW);
+    sceGuDepthBuffer((void *)(FRAME_SIZE * 2), BW);
+    sceGuOffset(2048 - (SW / 2), 2048 - (SH / 2));
+    sceGuViewport(2048, 2048, SW, SH);
+    sceGuDepthRange(65535, 0);
+    sceGuScissor(0, 0, SW, SH);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDepthFunc(GU_GEQUAL);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuDisable(GU_CULL_FACE);
+    sceGuShadeModel(GU_SMOOTH);
+    sceGuEnable(GU_CLIP_PLANES);
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+    sceGuFog(50.0f, 190.0f, RGB(255, 96, 92));
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceDisplayWaitVblankStart();
+    sceGuDisplay(GU_TRUE);
 }
 
 int main(void) {
     setup_callbacks();
+    gfx_init();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
-    uint8_t *vb = (uint8_t *)sceGeEdramGetAddr();
-    sceDisplaySetMode(0, SW, SH);
-    for (int i = 0; i < 2; i++) {
-        dispbuf[i] = vb + i * BW * SH * 4;
-        drawbuf[i] = (uint32_t *)((uintptr_t)vb + 0x40000000u + (uintptr_t)i * BW * SH * 4);
-    }
-    sceDisplaySetFrameBuf(dispbuf[0], BW, PSP_DISPLAY_PIXEL_FORMAT_8888, PSP_DISPLAY_SETBUF_NEXTFRAME);
-    init_map();
-    srand(sceKernelGetSystemTimeLow());
+    rng = sceKernelGetSystemTimeLow() | 1;
+    reset_game();
 
-    SceCtrlData pad; unsigned prev = 0;
+    SceCtrlData pad;
+    unsigned prev = 0;
+    int pal = 0, par = 0;
     for (;;) {
         sceCtrlPeekBufferPositive(&pad, 1);
-        unsigned down = pad.Buttons & ~prev; prev = pad.Buttons;
-        frame++;
-        back = drawbuf[cur];
+        unsigned b = pad.Buttons;
+        int al = pad.Lx < 60, ar = pad.Lx > 196;
+        in_left  = ((b & PSP_CTRL_LEFT)  && !(prev & PSP_CTRL_LEFT))  || (al && !pal);
+        in_right = ((b & PSP_CTRL_RIGHT) && !(prev & PSP_CTRL_RIGHT)) || (ar && !par);
+        in_jump  = ((b & (PSP_CTRL_CROSS | PSP_CTRL_SQUARE)) != 0);
+        in_start = (b & PSP_CTRL_START) && !(prev & PSP_CTRL_START);
+        prev = b; pal = al; par = ar;
 
-        if (state == TITLE) {
-            if (down & PSP_CTRL_START) new_game();
-            sky(); draw_shard(232, 24);
-            ctext(70, "JAYJAY QUEST", 5, RGB(244,196,48));
-            ctext(120, "THE SUN SHARD", 3, RGB(154,143,216));
-            ctext(160, "SLAY THE GUARDIAN", 2, RGB(255,255,255));
-            ctext(180, "CROSS OR SQUARE SWORD", 2, RGB(255,255,255));
-            if ((frame / 30) & 1) ctext(212, "PRESS START", 3, RGB(244,196,48));
-            ctext(250, "A GAME BY JAYJAY", 2, RGB(109,99,168));
-        } else if (state == PLAY) {
-            update_play(&pad, down);
-            draw_world();
-        } else if (state == OVER) {
-            if (down & PSP_CTRL_START) state = TITLE;
-            draw_world();
-            for (int y = 0; y < SH; y += 2) rect(0, y, SW, 1, RGB(0,0,0));
-            ctext(100, "GAME OVER", 6, RGB(255,68,102));
-            if ((frame / 30) & 1) ctext(170, "PRESS START", 3, RGB(255,255,255));
-        } else {
-            ct++;
-            if (down & PSP_CTRL_START) state = TITLE;
-            sky();
-            int y0 = SH - ct / 2, lim = 126 - (NCR - 1) * 34;
-            if (y0 < lim) y0 = lim;
-            for (int i = 0; i < NCR; i++) {
-                int y = y0 + i * 34;
-                if (y < -30 || y > SH) continue;
-                if (CR[i][0] == 'J' && CR[i][1] == 'A') ctext(y, CR[i], 4, RGB(255,255,255));
-                else ctext(y, CR[i], 2, i == NCR - 1 ? RGB(255,224,102) : RGB(154,143,216));
-            }
-        }
-
+        update(1.0f / 60.0f);
+        render();
         sceDisplayWaitVblankStart();
-        sceDisplaySetFrameBuf(dispbuf[cur], BW, PSP_DISPLAY_PIXEL_FORMAT_8888, PSP_DISPLAY_SETBUF_NEXTFRAME);
-        cur ^= 1;
+        sceGuSwapBuffers();
     }
     return 0;
 }
