@@ -11,47 +11,36 @@ jobs:
     name: Build PSP EBOOT
     runs-on: ubuntu-latest
 
-    container:
-      image: ghcr.io/pspdev/pspdev:latest
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Check PSP toolchain
-        run: |
-          echo "PSPDEV=$PSPDEV"
-          echo "PSPSDK=$PSPSDK"
-          psp-gcc --version
-          make --version
-
-      - name: Install Python
-        run: |
-          apt-get update
-          apt-get install -y python3
-
       - name: Generate 3D assets
         run: |
-          if [ -f tools/gen_assets.py ]; then
-            python3 tools/gen_assets.py
-          else
-            echo "ERROR: tools/gen_assets.py not found"
-            exit 1
-          fi
+          python3 --version
+          python3 tools/gen_assets.py
 
       - name: Check generated assets
         run: |
           echo "Generated assets:"
           find assets -maxdepth 1 -type f -print | sort
 
-      - name: Build Ashfall
+      - name: Build with PSPDEV
         run: |
-          make clean || true
-          make
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            ghcr.io/pspdev/pspdev:latest \
+            make clean
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            ghcr.io/pspdev/pspdev:latest \
+            make
 
       - name: Show build output
         run: |
-          echo "EBOOT.PBP:"
           ls -lh EBOOT.PBP
 
       - name: Upload PSP game
