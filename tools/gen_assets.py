@@ -205,10 +205,44 @@ def char_parts(prefix):
     a=Mesh(); cylinder(a,0,-.44,0,.085,.88,7,"dark"); a.write(os.path.join(OUT,prefix+"_leg.obj"))
 
 def icons():
-    im=Img(144,80,(28,27,38)); im.rect(0,58,143,79,(18,18,25))
-    for x,h in [(8,8),(22,13),(39,10),(57,17),(78,11),(98,15),(120,9),(134,13)]:
-        im.rect(x,58-h,x+10,58,(67,53,50)); im.rect(x+2,54-h,x+8,58-h,(105,62,48))
-    im.line(15,50,72,26,(194,154,79)); im.line(72,26,128,50,(194,154,79)); im.rect(63,27,81,31,(55,69,82)); im.rect(69,20,75,27,(112,77,58)); im.rect(8,8,136,12,(84,58,53)); im.rect(8,15,100,18,(141,93,63)); im.save_png(os.path.join(ICO,"ICON0.PNG"))
+    # PSP ICON0.PNG: 144x80. Keep the artwork high-contrast so it is
+    # readable in PPSSPP's small game-list tile.
+    im=Img(144,80,(18,20,32))
+
+    # dusk gradient bands
+    for y in range(80):
+        r=18 + y//10
+        gg=20 + y//12
+        b=32 + y//5
+        im.rect(0,y,143,y,(r,gg,b))
+
+    # distant town silhouette
+    for x,h in [(5,18),(20,26),(37,21),(54,31),(74,23),(92,29),(112,20),(130,27)]:
+        im.rect(x,58-h,x+10,58,(48,40,48))
+        im.rect(x+2,55-h,x+8,58-h,(108,62,48))
+
+    # central lantern / flame emblem
+    im.rect(61,24,83,27,(196,154,76))
+    im.rect(64,28,80,54,(112,72,44))
+    im.rect(67,31,77,51,(32,43,57))
+    im.rect(69,33,75,48,(216,170,83))
+    im.rect(70,35,74,46,(246,204,105))
+    im.rect(68,49,76,53,(71,47,34))
+    im.rect(68,20,76,24,(142,98,54))
+    im.rect(71,16,73,20,(205,157,74))
+
+    # small "A" mark
+    im.line(65,63,72,56,(214,171,91))
+    im.line(72,56,79,63,(214,171,91))
+    im.line(68,61,76,61,(214,171,91))
+
+    # title bars
+    im.rect(8,7,136,10,(111,73,56))
+    im.rect(8,13,58,15,(193,137,72))
+    im.rect(8,17,43,19,(66,75,91))
+
+    im.save_png(os.path.join(ICO,"ICON0.PNG"))
+
     bg=Img(480,272,(38,34,48)); bg.rect(0,185,479,271,(48,44,51))
     for x,w,h in [(20,70,80),(105,80,100),(205,65,70),(285,90,110),(390,75,85)]:
         bg.rect(x,185-h,x+w,185,(74,57,55)); bg.rect(x+8,173-h,x+w-8,185-h,(104,61,50))
