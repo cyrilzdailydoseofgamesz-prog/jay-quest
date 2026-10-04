@@ -1,6 +1,8 @@
-/* ECHOES OF HOLLOW BAY - PSP story adventure (pspdev SDK, runs on PPSSPP)
- * 3D blocky characters via sceGu, dialogue engine, choices, 5 chapters, 3 endings.
- * Controls: stick/D-pad move, L/R camera, O run, X talk/advance, START title.
+/* ASHFALL - PSP 3D story adventure, VERTICAL SLICE (pspdev SDK / PPSSPP)
+ * One location, 1 NPC, 1 enemy type (3 shades), 1 mission, melee combat, dialogue + choice,
+ * health, inventory/key item, collectibles, checkpoint save/load, pause menu, objectives.
+ * Smooth textured meshes with baked vertex lighting, fog, distance culling, 30 FPS lock.
+ * Placeholders are generated in code. Drop real assets in assets/ (see bottom of file).
  */
 #include <pspkernel.h>
 #include <pspdisplay.h>
@@ -12,717 +14,637 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 
-PSP_MODULE_INFO("Echoes of Hollow Bay", 0, 1, 0);
+PSP_MODULE_INFO("Ashfall Slice", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
+PSP_HEAP_SIZE_KB(12 * 1024);
 
 #define BW 512
 #define SW 480
 #define SH 272
 #define FS (BW * SH * 4)
+#define PI 3.14159265f
+#define DT (1.0f / 30.0f)
 #define RGB(r,g,b) (0xff000000u | ((unsigned)(b) << 16) | ((unsigned)(g) << 8) | (unsigned)(r))
 #define RGBA(r,g,b,a) (((unsigned)(a) << 24) | ((unsigned)(b) << 16) | ((unsigned)(g) << 8) | (unsigned)(r))
+#define SKY RGB(70,60,95)
 
-static unsigned int __attribute__((aligned(16))) list[0x40000];
+static unsigned int __attribute__((aligned(16))) list[0x20000];
 static int running = 1;
-
 static int exitCb(int a, int b, void *c) { (void)a; (void)b; (void)c; running = 0; sceKernelExitGame(); return 0; }
-static int cbThread(SceSize a, void *b) {
-    (void)a; (void)b;
-    int id = sceKernelCreateCallback("exit", exitCb, NULL);
-    sceKernelRegisterExitCallback(id);
-    sceKernelSleepThreadCB();
-    return 0;
-}
+static int cbThread(SceSize a, void *b) { (void)a; (void)b; sceKernelRegisterExitCallback(sceKernelCreateCallback("exit", exitCb, NULL)); sceKernelSleepThreadCB(); return 0; }
 
-/* ---------------------------------------------------------------- 3D */
-typedef struct { unsigned int c; float x, y, z; } V;
-#define VT (GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
+/* ------------------------------------------------------------ meshes */
+typedef struct { float u, v; unsigned c; float x, y, z; } TV;
+#define TVT (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
+typedef struct { TV *v; int n; } M;
+typedef struct { unsigned *d; int w, h; } Tex;
 
-static unsigned seed;
-static float rnd(void) { seed = seed * 1664525u + 1013904223u; return ((seed >> 8) & 0xffff) / 65535.0f; }
+#define ARENA 90000
+static TV *arena; static int arenaN;
+static TV *tvAlloc(int n) { if (arenaN + n > ARENA) return NULL; TV *p = arena + arenaN; arenaN += n; return p; }
 
 static unsigned sh(unsigned c, int p) {
     unsigned r = (c & 255) * p / 100, g = ((c >> 8) & 255) * p / 100, b = ((c >> 16) & 255) * p / 100;
-    if (r > 255) r = 255;
-    if (g > 255) g = 255;
-    if (b > 255) b = 255;
+    if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
     return 0xff000000u | r | (g << 8) | (b << 16);
 }
-
-static float gx, gy, gz, gs, gc, gk = 1;
-static void setT(float x, float y, float z, float yaw, float k) { gx = x; gy = y; gz = z; gs = sinf(yaw); gc = cosf(yaw); gk = k; }
-
-static void box(float ox, float oy, float oz, float hx, float hy, float hz, unsigned col) {
-    static const unsigned char F[6][4] = {{0,1,3,2},{4,5,7,6},{0,2,6,4},{1,3,7,5},{0,1,5,4},{2,3,7,6}};
-    static const unsigned char T[6] = {0,1,2,0,2,3};
-    static const int SHD[6] = {65,65,80,80,50,100};
-    float X[8], Y[8], Z[8];
-    int i, f, k = 0;
-    ox *= gk; oy *= gk; oz *= gk; hx *= gk; hy *= gk; hz *= gk;
-    for (i = 0; i < 8; i++) {
-        float lx = ox + ((i & 1) ? hx : -hx), ly = oy + ((i & 2) ? hy : -hy), lz = oz + ((i & 4) ? hz : -hz);
-        X[i] = gx + lx * gc + lz * gs; Y[i] = gy + ly; Z[i] = gz - lx * gs + lz * gc;
-    }
-    V *v = sceGuGetMemory(36 * sizeof(V));
-    for (f = 0; f < 6; f++) {
-        unsigned c = sh(col, SHD[f]);
-        for (i = 0; i < 6; i++) { int j = F[f][T[i]]; v[k].c = c; v[k].x = X[j]; v[k].y = Y[j]; v[k].z = Z[j]; k++; }
-    }
-    sceGumDrawArray(GU_TRIANGLES, VT, 36, 0, v);
+/* baked lighting: one fixed sun + ambient, computed once at build time */
+static unsigned bake(unsigned c, float nx, float ny, float nz) {
+    float l = sqrtf(nx * nx + ny * ny + nz * nz);
+    if (l > 0) { nx /= l; ny /= l; nz /= l; }
+    float d = nx * -.4f + ny * .8f + nz * -.45f; if (d < 0) d = 0;
+    return sh(c, (int)((.5f + .65f * d) * 100));
 }
 
-static void person(float x, float y, float z, float yaw, unsigned sk, unsigned sht, unsigned pa, unsigned ha, unsigned ey, float w, float k) {
-    float s = sinf(w) * .35f;
-    setT(x, y, z, yaw, k);
-    box(-.2f, .45f, s * .5f, .15f, .45f, .15f, pa); box(.2f, .45f, -s * .5f, .15f, .45f, .15f, pa);
-    box(0, 1.25f, 0, .38f, .4f, .2f, sht);
-    box(-.54f, 1.25f, -s * .5f, .1f, .36f, .1f, sht); box(.54f, 1.25f, s * .5f, .1f, .36f, .1f, sht);
-    box(0, 1.95f, 0, .28f, .28f, .28f, sk);
-    box(0, 2.2f, -.02f, .3f, .1f, .3f, ha); box(0, 1.95f, -.27f, .3f, .3f, .05f, ha);
-    box(-.1f, 2.0f, .28f, .04f, .05f, .02f, ey); box(.1f, 2.0f, .28f, .04f, .05f, .02f, ey);
+static void ringN(const float *pr, const float *py, int n, int i, float *nr, float *ny) {
+    int a = i > 0 ? i - 1 : i, b = i < n - 1 ? i + 1 : i;
+    float dr = pr[b] - pr[a], dy = py[b] - py[a], l = sqrtf(dr * dr + dy * dy);
+    if (l < 1e-5f) { *nr = 1; *ny = 0; return; }
+    *nr = dy / l; *ny = -dr / l;
 }
-
-static void fox(float x, float z, float yaw, float t) {
-    unsigned o = RGB(230,120,40), w = RGB(250,250,250), d = RGB(60,40,30);
-    setT(x, 0, z, yaw, 1);
-    box(0, .5f, 0, .22f, .2f, .5f, o); box(0, .75f, .6f, .18f, .17f, .18f, o); box(0, .7f, .82f, .07f, .06f, .06f, d);
-    box(-.1f, .98f, .55f, .05f, .1f, .04f, o); box(.1f, .98f, .55f, .05f, .1f, .04f, o);
-    box(0, .55f + sinf(t * 3) * .05f, -.75f, .1f, .1f, .35f, o); box(0, .55f, -1.12f, .1f, .1f, .08f, w);
-    box(-.15f, .15f, .35f, .05f, .15f, .05f, d); box(.15f, .15f, .35f, .05f, .15f, .05f, d);
-    box(-.15f, .15f, -.35f, .05f, .15f, .05f, d); box(.15f, .15f, -.35f, .05f, .15f, .05f, d);
+static void pv(TV *v, float r, float y, float a, float nr, float ny, float u, float vv, unsigned col) {
+    float c = cosf(a), s = sinf(a);
+    v->u = u; v->v = vv; v->c = bake(col, nr * c, ny, nr * s); v->x = r * c; v->y = y; v->z = r * s;
 }
-
-static void shardObj(float x, float z, unsigned col, float t) {
-    float b = sinf(t * 2) * .15f;
-    setT(x, 0, z, t * 1.5f, 1);
-    box(0, 1.3f + b, 0, .22f, .55f, .22f, col); box(0, 1.3f + b, 0, .4f, .2f, .1f, col);
-    box(0, .1f, 0, .5f, .1f, .5f, RGB(80,80,100));
-}
-static void bookObj(float x, float z, unsigned col) {
-    setT(x, 0, z, .6f, 1);
-    box(0, .5f, 0, .1f, .5f, .1f, RGB(90,70,50)); box(0, 1.1f, 0, .45f, .06f, .35f, col); box(0, 1.17f, 0, .4f, .02f, .3f, RGB(240,235,210));
-}
-static void blob(float x, float z, float yaw, unsigned col, float t) {
-    setT(x, 0, z, yaw, 1);
-    float b = .1f + sinf(t * 2) * .08f;
-    box(0, .5f + b, 0, .5f, .4f, .5f, col); box(-.18f, .75f + b, .5f, .07f, .07f, .03f, RGB(10,10,10)); box(.18f, .75f + b, .5f, .07f, .07f, .03f, RGB(10,10,10));
-}
-static void marker(float x, float y, float z, float t) {
-    setT(x, y + sinf(t * 3) * .15f, z, t * 2, 1);
-    box(0, 0, 0, .18f, .25f, .18f, RGB(255,230,60));
-}
-
-/* ---------------------------------------------------------------- scenes */
-typedef struct { float x, z, r, v; int t; } P;
-typedef struct { const char *n; unsigned sky, gr; float b, fog; } S;
-static const S SC[5] = {
-    {"Hollow Bay",      RGB(150,170,190), RGB(90,120,80),   30, 70},
-    {"Whispering Woods",RGB(40,70,60),    RGB(30,70,40),    32, 50},
-    {"Lighthouse Point",RGB(120,130,160), RGB(110,110,90),  30, 75},
-    {"The Tidecaves",   RGB(8,12,30),     RGB(25,30,50),    28, 34},
-    {"Point at Dawn",   RGB(235,170,140), RGB(110,130,85),  30, 90}
-};
-
-/* ---------------------------------------------------------------- story data */
-typedef struct { const char *s, *t; } L;
-#define E {0,0}
-
-static const L d_intro1[] = {
-{"","Hollow Bay. A fishing town at the edge of the map, and the only place Dad's last letter ever mentioned."},
-{"Kai","Seven nights since the lighthouse went dark. The letter said come before the light fails. I'm late."},
-{"","Fog crawls through the streets. Somewhere a bell rings, though no one is pulling the rope."},
-{"","Stick: walk. L/R: camera. O: run. X: talk or advance. Look for the yellow markers."},E};
-static const L d_mara[] = {
-{"Mara","You have Elias's eyes. You're his kid, aren't you?"},
-{"Kai","You knew my father?"},
-{"Mara","Everyone did. Every autumn he climbed the tower and tended the lamp. This year he went up and never came down."},
-{"Mara","Then people started vanishing. The Hendry twins, half the harbor crew. Only the fog stayed."},
-{"*","I'll find them.|Not my problem, sorry."},
-{"Mara","That's what he said too. Take the room upstairs if you need it. And trust the little ones, Kai. They notice things."},
-{"Mara","Hm. Then why come at all? The door's open, whatever you decide."},
-{"Mara","Talk to Old Tom on the pier. He saw the light die."},E};
-static const L d_tom[] = {
-{"Tom","Careful, lad. The fog bites after dusk."},
-{"Tom","I saw it happen. The beam swung round three times, slow as a heartbeat, then burst into three pieces and scattered."},
-{"Kai","Burst? A light can't burst."},
-{"Tom","This one was ground from a star that fell in the bay. Three lens shards, flung far."},
-{"Tom","One into the Whispering Woods. One back inside the tower. One down into the sea caves."},
-{"Tom","Gather them, set them in the lamp, and maybe the bay wakes up."},
-{"Kai","And if it doesn't?"},
-{"Tom","Then at least you tried. That's more than most of us did."},E};
-static const L d_pip[] = {
-{"Pip","Are you the new person? You smell like a bus!"},
-{"Kai","It WAS a bus. What are you doing out in the fog alone?"},
-{"Pip","I'm not alone. Biscuit is with me."},
-{"Kai","...Biscuit?"},
-{"Pip","He's a ghost dog. Only I can see him. He says the woods are singing again."},
-{"Pip","Biscuit says you're brave. He also says you're slow."},
-{"Kai","Fair. Stay close, both of you."},E};
-static const L d_bertie[] = {
-{"Bertie","Counting gulls. Forty-one today. Last spring it was three hundred."},
-{"Bertie","They all flew inland, toward the woods. Every last one."},
-{"Bertie","Gulls know when a place is dying. Or about to be born. Same flight pattern, really."},E};
-static const L d_out1[] = {
-{"","By dusk Kai sets out along the old coast road, lantern swinging, a small shadow trailing behind."},
-{"Kai","Woods first, then the tower, then whatever's underneath."},
-{"Pip","Biscuit says the last part is a terrible idea."},
-{"","Behind you, the town's bell rings once and falls silent."},E};
-
-static const L d_intro2[] = {
-{"","The Whispering Woods hum with one low note, like a wet finger on the rim of a glass."},
-{"Kai","Why do I feel like the trees are talking about me?"},
-{"Pip","(from far behind) Only the polite ones!"},E};
-static const L d_elda[] = {
-{"Elda","Visitors. How rare. And you carry the keeper's stubbornness on your shoulders."},
-{"Kai","Everyone keeps saying that."},
-{"Elda","The woods remember him. He came here to hide the first shard from something."},
-{"Kai","From what?"},
-{"Elda","The Tide Warden. It guards the caves, and it believes the light is a cage."},
-{"Elda","Long ago the lighthouse did not guide ships. It held something down."},
-{"Kai","Dad never told me any of this."},
-{"Elda","He hoped you would never need to know. Speak with Ember. The fox holds the shard's trail."},E};
-static const L d_ember[] = {
-{"Ember","Sniff, sniff. Lighthouse blood. Fine, I will talk."},
-{"Kai","You can speak?"},
-{"Ember","I have always spoken. Humans seldom listen."},
-{"Ember","The shard sleeps in the hollow oak. First, an honest answer. What matters most?"},
-{"*","Saving the people.|Restoring the light."},
-{"Ember","A rare answer. People first. The light will follow if the heart is right."},
-{"Ember","Practical. Light first, then. Practical hearts break less, though they bend less too."},
-{"Ember","The hollow oak is the one that glows. Do not dawdle."},E};
-static const L d_shard1[] = {
-{"","Inside the hollow oak, a shard of pale glass hums, warm as a heartbeat."},
-{"Kai","One down."},
-{"","SHARD 1 OF 3 RECOVERED."},E};
-static const L d_stump[] = {
-{"Moss","Psst. Over here. I'm a stump."},
-{"Kai","I can see that."},
-{"Moss","Five hundred years standing here and nobody asks how I'm doing."},
-{"Kai","...How are you doing?"},
-{"Moss","Damp. Thank you for asking."},E};
-static const L d_out2[] = {
-{"","The humming softens as you leave, almost grateful."},
-{"Elda","Go carefully. The tower remembers what was done there."},
-{"Kai","I'm starting to think everything here remembers more than I do."},E};
-
-static const L d_intro3[] = {
-{"","Lighthouse Point. The tower looms over the cliffs, its great lamp dark, its door hanging open."},
-{"Pip","Biscuit won't go in. He says it's rude to walk into a grave."},
-{"Kai","It isn't a grave."},
-{"Pip","Okay. He says 'yet'."},E};
-static const L d_keeper[] = {
-{"Ansel","You are late, young Elias. No... no, you are his child."},
-{"Kai","Who are you?"},
-{"Ansel","Ansel. Keeper before your father. I stayed when the light went out."},
-{"Ansel","The lamp never guided ships, Kai. It sealed the cave mouth below. Every night for four hundred years."},
-{"Kai","And now it's broken."},
-{"Ansel","Your father broke it. On purpose."},
-{"Kai","Why would he do that?"},
-{"Ansel","Because the Warden is no monster. It is the last of the bay's old guardians, and we have starved it of the sea."},
-{"Ansel","The vanished townsfolk are with it, safe but sleeping. Read Elias's logbook."},E};
-static const L d_log[] = {
-{"","Elias's logbook, the last page, ink smudged by salt."},
-{"Elias","Kai, if you are reading this, I did not make it back."},
-{"Elias","I opened the seal because I could no longer live with what we did to the Warden."},
-{"Elias","It will ask you a question. Answer with your own heart, not mine."},
-{"Elias","Tell Mara I'm sorry about the debt. Tell yourself none of this was your fault. Love, Dad."},
-{"Kai","...Dad."},
-{"","Somewhere behind you, a small hand slips into yours."},E};
-static const L d_shard2[] = {
-{"","The second shard glows in the lamp housing, wedged between brass gears."},
-{"Kai","Two."},
-{"","SHARD 2 OF 3 RECOVERED."},E};
-static const L d_pip3[] = {
-{"Pip","Kai? Biscuit says your dad isn't dead."},
-{"Pip","He says the sea took him gently. He's down there with the others."},
-{"Kai","Can he really tell?"},
-{"Pip","He's a dog. Dogs always know."},
-{"Kai","Then let's go and get them back."},E};
-static const L d_crab[] = {
-{"Crab","Click. Click. I am the true keeper of this lighthouse."},
-{"Kai","Of course you are."},
-{"Crab","Rent is due."},
-{"Kai","I am completely out of rent."},
-{"Crab","Click."},E};
-static const L d_out3[] = {
-{"","Behind the tower, a spiral stair drops into the cliffside, wet and glowing a faint blue."},
-{"Kai","That's the way down."},
-{"Pip","Biscuit says he'll wait up here. Very firmly."},E};
-
-static const L d_intro4[] = {
-{"Kai","I told Pip to wait with Biscuit. This is no place for a kid."},
-{"","The caves breathe. Every few seconds the walls glow, then dim, in time with something vast and slow."},
-{"Kai","That sounds like a heartbeat. Great."},E};
-static const L d_wisp[] = {
-{"Wisp","...ssss... Hollow... Bay... was... a... harbor... for... spirits..."},
-{"Kai","A harbor for spirits?"},
-{"Wisp","We came... to rest... men built... the light... to keep us... from leaving..."},
-{"Wisp","Warden... keeps... the door... Warden... is... tired..."},
-{"Kai","Then I'll listen to it before I decide anything."},E};
-static const L d_warden[] = {
-{"Warden","ELIAS'S CHILD. THE LAST SHARD'S SCENT CLINGS TO YOU."},
-{"Kai","Where are the townsfolk? Where is my father?"},
-{"Warden","ASLEEP IN MY TIDE. SAFE. THEY CANNOT WAKE WHILE THE LIGHT STAYS BROKEN."},
-{"Warden","FOUR CENTURIES YOUR PEOPLE CHAINED THE SEA TO THIS ROCK. I AM ALL THAT REMAINS OF WHAT YOU CALLED MONSTERS."},
-{"*","I'll listen to you.|Give them back. Now."},
-{"Warden","ELIAS DID NOT LISTEN. YOU WILL HAVE MORE TIME THAN HE DID."},
-{"Warden","ANGER. HE ARRIVED WITH ANGER TOO. SEE WHERE IT LED HIM."},
-{"Warden","TAKE THE THIRD SHARD FROM THE PEARL BED. THEN DECIDE WHAT THE LIGHT IS FOR."},E};
-static const L d_shard3[] = {
-{"","The last shard rests in a drift of glowing pearls, warm as a held breath."},
-{"Kai","Three."},
-{"","SHARD 3 OF 3 RECOVERED. The caves tremble, then go still."},E};
-static const L d_echo[] = {
-{"Echo","Echo... echo..."},
-{"Kai","Hello?"},
-{"Echo","Hello? Hello? Who's there? Who's there?"},
-{"Kai","That is not funny."},
-{"Echo","Funny. Funny. Funny."},E};
-static const L d_out4[] = {
-{"","You climb back to the surface as the tide rises, three shards humming in your pack."},
-{"Warden","(far below) THE SEA WILL WAIT. IT HAS WAITED LONGER."},
-{"Kai","No pressure, then."},E};
-
-static const L d_intro5[] = {
-{"","Dawn is a thin silver line on the water. The villagers have gathered at the tower, lanterns raised."},
-{"Kai","Everyone's here. Mara, Tom, Pip... and every light in town."},E};
-static const L d_mara5[] = {
-{"Mara","Kai! You're alive. Whatever you did down there, the fog is thinning."},
-{"Kai","The light isn't mended yet."},
-{"Mara","Then mend it. We'll hold the lanterns."},
-{"Mara","Your father owed me nothing, you know. I only wanted him home."},E};
-static const L d_tom5[] = {
-{"Tom","Forty years I've fished these waters. Never saw the tide look at me before."},
-{"Tom","Whatever you choose, lad, the bay will remember it."},E};
-static const L d_pip5[] = {
-{"Pip","Biscuit says whatever you pick, he still thinks you're brave. And slow."},
-{"Pip","...And that he's proud of you."},E};
-static const L d_lens[] = {
-{"","At the lamp's heart, the three shards slide together and hum as one."},
-{"Kai","A seal, or a door. Dad wanted me to choose with my own heart."},
-{"Ansel","Whatever you choose, it will outlast you both."},
-{"*","Seal the cave again.|Open the way home."},
-{"","The lamp ignites, white and cold. Far below, something vast sighs and sleeps."},
-{"","The lamp ignites warm and gold, and the whole sea answers."},E};
-static const L d_enda[] = {
-{"","The sleepers wake by morning, blinking, bewildered, safe. Elias stands among them, older and weeping."},
-{"Elias","Kai. I'm so sorry I left you the weight of it."},
-{"Kai","You're here. That's all I wanted."},
-{"","The bay is whole again. But on still nights Kai hears the tide asking a question no one answers."},
-{"","ENDING 1 OF 3 - THE SEAL"},E};
-static const L d_endb[] = {
-{"","The Warden rises from the bay in a column of silver water and bows to Kai, once."},
-{"Warden","THE LIGHT WILL GUIDE. IT WILL NOT CAGE. THIS IS A FAIR TIDE."},
-{"","The sleepers wake on the shore. Elias runs up the beach, and Mara runs after him, furious and laughing."},
-{"","The lighthouse still shines, but now it welcomes the sea instead of chaining it. The gulls return by noon."},
-{"","ENDING 3 OF 3 - THE HARBOR (TRUE ENDING)"},E};
-static const L d_endc[] = {
-{"","The Warden slips into the open sea, grateful but wild, and the tide reclaims the harbor wall in a single night."},
-{"","The sleepers wake, soaked and alive. The town must learn to live beside something it once feared."},
-{"Kai","I should have listened more. Next time, I will."},
-{"","ENDING 2 OF 3 - THE TIDE RETURNS"},E};
-
-enum { D_INTRO1, D_MARA, D_TOM, D_PIP, D_BERTIE, D_OUT1,
-       D_INTRO2, D_ELDA, D_EMBER, D_SHARD1, D_STUMP, D_OUT2,
-       D_INTRO3, D_KEEPER, D_LOG, D_SHARD2, D_PIP3, D_CRAB, D_OUT3,
-       D_INTRO4, D_WISP, D_WARDEN, D_SHARD3, D_ECHO, D_OUT4,
-       D_INTRO5, D_MARA5, D_TOM5, D_PIP5, D_LENS, D_ENDA, D_ENDB, D_ENDC, D_N };
-
-static const L *const DL[D_N] = {
-    d_intro1, d_mara, d_tom, d_pip, d_bertie, d_out1,
-    d_intro2, d_elda, d_ember, d_shard1, d_stump, d_out2,
-    d_intro3, d_keeper, d_log, d_shard2, d_pip3, d_crab, d_out3,
-    d_intro4, d_wisp, d_warden, d_shard3, d_echo, d_out4,
-    d_intro5, d_mara5, d_tom5, d_pip5, d_lens, d_enda, d_endb, d_endc };
-
-typedef struct { const char *t, *goal; int mask, intro, outro; } C;
-static const C CH[5] = {
-    {"Ch.1 Arrival",        "Talk to Mara, Tom and Pip. Find 3 lanterns.", 7,  D_INTRO1, D_OUT1},
-    {"Ch.2 Whispering Woods","Speak to Elda and Ember. Take the shard.",   7,  D_INTRO2, D_OUT2},
-    {"Ch.3 Lighthouse",     "Learn Elias's fate. Take the 2nd shard.",     15, D_INTRO3, D_OUT3},
-    {"Ch.4 The Tidecaves",  "Face the Warden. Take the last shard.",       7,  D_INTRO4, D_OUT4},
-    {"Ch.5 Dawn",           "Gather the village. Mend the great lens.",    15, D_INTRO5, -1}
-};
-
-enum { K_P, K_SHARD, K_BOOK, K_FOX, K_BLOB, K_GIANT };
-typedef struct {
-    const char *n; int ch; float x, z; unsigned sk, sht, pa, ha;
-    int kind, dlg, bit, req, act; const char *rep;
-} N;
-#define SKA RGB(240,200,170)
-#define SKB RGB(200,150,110)
-#define SKC RGB(140,95,65)
-static N NP[] = {
- {"Mara",0,-7,-5,SKA,RGB(180,60,60),RGB(60,50,50),RGB(90,40,30),K_P,D_MARA,0,0,0,"Talk to Tom on the pier. He saw the light die."},
- {"Old Tom",0,9,-10,SKB,RGB(60,90,140),RGB(70,70,60),RGB(210,210,210),K_P,D_TOM,1,0,0,"Mind the fog, lad. It bites."},
- {"Pip",0,-13,9,SKC,RGB(240,200,60),RGB(70,70,130),RGB(30,20,20),K_P,D_PIP,2,0,0,"Biscuit says hi! He's licking your boot."},
- {"Bertie",0,15,10,SKA,RGB(90,140,90),RGB(100,80,60),RGB(150,110,50),K_P,D_BERTIE,-1,0,0,"Forty-one gulls. Forty-one."},
- {"Elda",1,-10,-8,SKB,RGB(110,60,140),RGB(60,40,70),RGB(190,190,200),K_P,D_ELDA,0,0,0,"Speak with Ember. The fox holds the trail."},
- {"Ember",1,9,-5,0,0,0,0,K_FOX,D_EMBER,1,0,0,"The oak glows. Follow the light."},
- {"Hollow Oak",1,2,16,RGB(170,240,255),RGB(170,240,255),0,0,K_SHARD,D_SHARD1,2,2,1,"Only an empty hollow remains."},
- {"Moss",1,-16,10,0,RGB(95,65,40),0,0,K_BLOB,D_STUMP,-1,0,0,"Still damp."},
- {"Ansel",2,0,-16.5f,RGB(200,220,255),RGB(150,180,230),RGB(120,140,200),RGB(240,240,250),K_P,D_KEEPER,0,0,0,"Read Elias's logbook. Please."},
- {"Logbook",2,10,-10,0,RGB(120,80,50),0,0,K_BOOK,D_LOG,1,1,0,"You have read it twice already."},
- {"Lamp Housing",2,-12,-12,RGB(180,255,230),RGB(180,255,230),0,0,K_SHARD,D_SHARD2,2,2,1,"Gears, brass, and an empty socket."},
- {"Pip",2,6,6,SKC,RGB(240,200,60),RGB(70,70,130),RGB(30,20,20),K_P,D_PIP3,3,0,0,"Biscuit says be brave. And slow."},
- {"Crab",2,-9,8,0,RGB(200,60,50),0,0,K_BLOB,D_CRAB,-1,0,0,"Click. Rent."},
- {"Wisp",3,-8,-6,0,RGB(150,200,255),0,0,K_BLOB,D_WISP,0,0,0,"...tired... so tired..."},
- {"Tide Warden",3,0,-21,RGB(30,60,100),RGB(20,40,80),RGB(15,30,60),RGB(40,200,220),K_GIANT,D_WARDEN,1,0,0,"THE THIRD SHARD WAITS IN THE PEARLS."},
- {"Pearl Bed",3,11,-12,RGB(255,220,255),RGB(255,220,255),0,0,K_SHARD,D_SHARD3,2,2,1,"Only pearls remain."},
- {"Echo",3,-12,10,0,RGB(200,200,255),0,0,K_BLOB,D_ECHO,-1,0,0,"Echo... echo..."},
- {"Mara",4,-8,-3,SKA,RGB(180,60,60),RGB(60,50,50),RGB(90,40,30),K_P,D_MARA5,0,0,0,"We'll hold the lanterns."},
- {"Old Tom",4,8,-4,SKB,RGB(60,90,140),RGB(70,70,60),RGB(210,210,210),K_P,D_TOM5,1,0,0,"The bay will remember."},
- {"Pip",4,0,-6,SKC,RGB(240,200,60),RGB(70,70,130),RGB(30,20,20),K_P,D_PIP5,2,0,0,"Biscuit is proud of you."},
- {"Great Lens",4,0,-14,RGB(255,225,110),RGB(255,225,110),0,0,K_SHARD,D_LENS,3,7,0,"The lens waits."},
-};
-#define NNP ((int)(sizeof(NP) / sizeof(NP[0])))
-
-/* ---------------------------------------------------------------- state */
-enum { M_TITLE, M_PLAY, M_SAY, M_CHOOSE, M_FADE, M_CREDITS };
-static int mode = M_TITLE, ch, flags, shards, trust, lensChoice, seen[32], got[5][5];
-static float px, pz, pyaw, walk, cam;
-static unsigned playF;
-
-static P pr[64]; static int np; static float lanX[5], lanZ[5];
-
-static int nearNpc(int sc, float x, float z, float d) {
-    for (int i = 0; i < NNP; i++) if (NP[i].ch == sc) { float a = NP[i].x - x, b = NP[i].z - z; if (a * a + b * b < d * d) return 1; }
-    return 0;
-}
-
-static void gen(int sc) {
-    float b = SC[sc].b;
-    seed = sc * 7919u + 13; np = 0;
-    if (sc == 2 || sc == 4) { pr[np].x = 0; pr[np].z = -24; pr[np].r = 4.6f; pr[np].v = 0; pr[np].t = 3; np++; }
-    for (int tries = 0; tries < 500 && np < 48; tries++) {
-        float x = (rnd() * 2 - 1) * (b - 2), z = (rnd() * 2 - 1) * (b - 2), q = rnd(), r; int t;
-        if (x * x + z * z < 36 || nearNpc(sc, x, z, 5.5f)) continue;
-        if (sc == 0) { if (q < .3f) { t = 1; r = 3.2f; } else if (q < .8f) { t = 0; r = 1; } else { t = 2; r = 1.2f; } }
-        else if (sc == 1) { if (q < .8f) { t = 0; r = 1; } else { t = 2; r = 1.2f; } }
-        else if (sc == 3) { if (q < .55f) { t = 4; r = 1.2f; } else { t = 2; r = 1.4f; } }
-        else { if (q < .2f) { t = 0; r = 1; } else { t = 2; r = 1.3f; } }
-        int ok = 1;
-        for (int i = 0; i < np; i++) { float a = pr[i].x - x, c = pr[i].z - z, m = pr[i].r + r + .5f; if (a * a + c * c < m * m) { ok = 0; break; } }
-        if (!ok) continue;
-        pr[np].x = x; pr[np].z = z; pr[np].r = r; pr[np].v = rnd(); pr[np].t = t; np++;
-    }
-    for (int i = 0; i < 16; i++) { pr[np].x = (rnd() * 2 - 1) * b; pr[np].z = (rnd() * 2 - 1) * b; pr[np].r = 1.5f + rnd() * 2.5f; pr[np].v = rnd(); pr[np].t = 5; np++; }
-    for (int k = 0; k < 5; k++) {
-        for (int tries = 0; tries < 200; tries++) {
-            float x = (rnd() * 2 - 1) * (b - 3), z = (rnd() * 2 - 1) * (b - 3); int ok = 1;
-            if (x * x + z * z < 16 || nearNpc(sc, x, z, 3)) continue;
-            for (int i = 0; i < np; i++) if (pr[i].t != 5) { float a = pr[i].x - x, c = pr[i].z - z, m = pr[i].r + 1.6f; if (a * a + c * c < m * m) { ok = 0; break; } }
-            if (ok) { lanX[k] = x; lanZ[k] = z; break; }
+/* surface of revolution: smooth organic shapes (bodies, heads, trees, lamps, fountain) */
+static M lathe(const float *pr, const float *py, int n, int seg, float ut, float vt, unsigned col) {
+    M m; m.n = (n - 1) * seg * 6; m.v = tvAlloc(m.n); int k = 0;
+    if (!m.v) { m.n = 0; return m; }
+    for (int i = 0; i < n - 1; i++) {
+        float nr0, ny0, nr1, ny1; ringN(pr, py, n, i, &nr0, &ny0); ringN(pr, py, n, i + 1, &nr1, &ny1);
+        for (int s = 0; s < seg; s++) {
+            float a0 = s * 2 * PI / seg, a1 = (s + 1) * 2 * PI / seg, u0 = ut * s / seg, u1 = ut * (s + 1) / seg;
+            float v0 = vt * i / (n - 1), v1 = vt * (i + 1) / (n - 1);
+            TV A, B, C, D;
+            pv(&A, pr[i], py[i], a0, nr0, ny0, u0, v0, col); pv(&B, pr[i], py[i], a1, nr0, ny0, u1, v0, col);
+            pv(&C, pr[i + 1], py[i + 1], a0, nr1, ny1, u0, v1, col); pv(&D, pr[i + 1], py[i + 1], a1, nr1, ny1, u1, v1, col);
+            m.v[k++] = A; m.v[k++] = C; m.v[k++] = B; m.v[k++] = B; m.v[k++] = C; m.v[k++] = D;
         }
     }
+    return m;
 }
-
-static int lantCount(int sc) { int n = 0; for (int i = 0; i < 5; i++) n += got[sc][i]; return n; }
-static int lantTotal(void) { int n = 0; for (int s = 0; s < 5; s++) n += lantCount(s); return n; }
-
-static void prop(const P *p) {
-    unsigned wall;
-    switch (p->t) {
-    case 0: { float h = 1.6f + p->v; unsigned lc = RGB(30 + (int)(p->v * 60), 100 + (int)(p->v * 80), 40);
-        if (ch == 1) lc = RGB(25 + (int)(p->v * 30), 80 + (int)(p->v * 50), 70);
-        setT(p->x, 0, p->z, p->v * 6, 1);
-        box(0, h * .5f, 0, .3f, h * .5f, .3f, RGB(95,65,40)); box(0, h + .8f, 0, 1.1f, .9f, 1.1f, lc); box(0, h + 1.9f, 0, .7f, .5f, .7f, lc); break; }
-    case 1: wall = sh(RGB(210,190,150), 80 + (int)(p->v * 40));
-        setT(p->x, 0, p->z, (int)(p->v * 4) * 1.5708f, 1);
-        box(0, 1.4f, 0, 2.2f, 1.4f, 1.8f, wall); box(0, 3.2f, 0, 2.6f, .4f, 2.2f, RGB(150,50,40)); box(0, 3.9f, 0, 1.8f, .4f, 1.6f, RGB(150,50,40));
-        box(0, .9f, 1.8f, .4f, .9f, .05f, RGB(70,45,30)); box(1.3f, 1.6f, 1.8f, .35f, .35f, .05f, RGB(255,230,150)); break;
-    case 2: { float s = .6f + p->v * .8f; setT(p->x, 0, p->z, p->v * 6, 1);
-        box(0, s * .6f, 0, s, s * .6f, s * .8f, ch == 3 ? RGB(60,65,85) : RGB(110,110,115)); box(.4f * s, s * 1.3f, 0, s * .5f, s * .4f, s * .5f, ch == 3 ? RGB(75,80,100) : RGB(130,130,135)); break; }
-    case 3: setT(p->x, 0, p->z, 0, 1);
-        box(0, 5, 0, 3, 5, 3, RGB(235,235,240)); box(0, 11, 0, 2.5f, 1.6f, 2.5f, RGB(200,50,50)); box(0, 14.5f, 0, 2.1f, 1.9f, 2.1f, RGB(235,235,240));
-        box(0, 17, 0, 2.5f, .4f, 2.5f, RGB(60,60,70)); box(0, 18.4f, 0, 1.4f, 1.0f, 1.4f, ch == 4 ? RGB(255,235,140) : RGB(30,30,40)); box(0, 19.8f, 0, 1.9f, .4f, 1.9f, RGB(60,60,70)); break;
-    case 4: setT(p->x, 0, p->z, p->v * 6, 1);
-        box(0, 1.6f, 0, .4f, 1.6f, .4f, RGB(70,160,230)); box(.5f, .8f, .2f, .25f, .8f, .25f, RGB(90,190,255)); box(-.4f, .6f, -.3f, .2f, .6f, .2f, RGB(60,130,210)); break;
-    case 5: setT(p->x, 0, p->z, 0, 1); box(0, .02f, 0, p->r, .02f, p->r, sh(SC[ch].gr, 80 + (int)(p->v * 45))); break;
+static M sphere(float r, float sy, int seg, unsigned col) {
+    float pr[7], py[7];
+    for (int i = 0; i < 7; i++) { float t = -PI / 2 + PI * i / 6; pr[i] = r * cosf(t); py[i] = r * sy * sinf(t); }
+    return lathe(pr, py, 7, seg, 2, 1, col);
+}
+static M boxM(float hx, float hy, float hz, unsigned col, float tu) {
+    static const unsigned char F[6][4] = {{0,1,3,2},{4,5,7,6},{0,2,6,4},{1,3,7,5},{0,1,5,4},{2,3,7,6}};
+    static const float FN[6][3] = {{0,0,-1},{0,0,1},{-1,0,0},{1,0,0},{0,-1,0},{0,1,0}};
+    static const unsigned char T[6] = {0,1,2,0,2,3};
+    M m; m.n = 36; m.v = tvAlloc(36); int k = 0;
+    if (!m.v) { m.n = 0; return m; }
+    for (int f = 0; f < 6; f++) {
+        unsigned c = bake(col, FN[f][0], FN[f][1], FN[f][2]);
+        for (int t = 0; t < 6; t++) {
+            int j = T[t], i = F[f][j];
+            m.v[k].c = c; m.v[k].u = (j == 1 || j == 2) ? tu : 0; m.v[k].v = (j >= 2) ? tu : 0;
+            m.v[k].x = (i & 1) ? hx : -hx; m.v[k].y = (i & 2) ? hy * 2 : 0; m.v[k].z = (i & 4) ? hz : -hz; k++;
+        }
     }
+    return m;
+}
+static M groundM(float half, float rep, float y, unsigned col) {
+    M m; m.n = 6; m.v = tvAlloc(6); if (!m.v) { m.n = 0; return m; }
+    static const float cx[6] = {-1,1,-1,-1,1,1}, cz[6] = {-1,-1,1,1,-1,1};
+    for (int i = 0; i < 6; i++) { m.v[i].c = bake(col, 0, 1, 0); m.v[i].u = (cx[i] + 1) * .5f * rep; m.v[i].v = (cz[i] + 1) * .5f * rep; m.v[i].x = cx[i] * half; m.v[i].y = y; m.v[i].z = cz[i] * half; }
+    return m;
 }
 
-static void drawNPC(const N *n, float t) {
-    float yaw = atan2f(px - n->x, pz - n->z);
-    switch (n->kind) {
-    case K_P: person(n->x, 0, n->z, yaw, n->sk, n->sht, n->pa, n->ha, RGB(20,20,20), 0, 1); break;
-    case K_GIANT: person(n->x, 0, n->z, yaw, n->sk, n->sht, n->pa, n->ha, RGB(150,255,255), t, 3.2f); break;
-    case K_FOX: fox(n->x, n->z, yaw, t); break;
-    case K_SHARD: shardObj(n->x, n->z, n->sht, t); break;
-    case K_BOOK: bookObj(n->x, n->z, n->sht); break;
-    case K_BLOB: blob(n->x, n->z, yaw, n->sht, t); break;
+/* ---- OBJ / TGA loaders: how real art gets in (assets/*.obj, assets/*.tga) ---- */
+static int corner(char **s, int *a, int *b, int *c) {
+    char *e; while (**s == ' ' || **s == '\t') (*s)++;
+    if (!**s || **s == '\n' || **s == '\r') return 0;
+    *a = (int)strtol(*s, &e, 10); *b = *c = 0; *s = e;
+    if (**s == '/') { (*s)++; if (**s != '/') { *b = (int)strtol(*s, &e, 10); *s = e; } if (**s == '/') { (*s)++; *c = (int)strtol(*s, &e, 10); *s = e; } }
+    return 1;
+}
+static M loadOBJ(const char *path) {
+    M m = {0, 0}; FILE *f = fopen(path, "rb"); if (!f) return m;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz + 1); if (!buf) { fclose(f); return m; }
+    if (fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); return m; }
+    buf[sz] = 0; fclose(f);
+    int nv = 0, nt = 0, nn = 0, tris = 0, a, b, c;
+    for (char *p = buf; *p;) {
+        if (p[0] == 'v' && p[1] == ' ') nv++; else if (p[0] == 'v' && p[1] == 't') nt++; else if (p[0] == 'v' && p[1] == 'n') nn++;
+        else if (p[0] == 'f' && p[1] == ' ') { char *q = p + 1; int k = 0; while (corner(&q, &a, &b, &c)) k++; if (k >= 3) tris += k - 2; }
+        while (*p && *p != '\n') p++; if (*p) p++;
     }
-}
-
-static int npcOpen(int i) { const N *n = &NP[i]; return !seen[i] && (flags & n->req) == n->req; }
-
-static void world(float t) {
-    const S *s = &SC[ch];
-    setT(0, 0, 0, 0, 1);
-    box(0, -.5f, 0, s->b + 14, .5f, s->b + 14, s->gr);
-    if (ch == 0 || ch == 2 || ch == 4) { setT(0, 0, 0, 0, 1); box(0, -.7f, -(s->b + 14) - 40, 150, .5f, 40, RGB(40,90,150)); }
-    float far2 = (s->fog + 8) * (s->fog + 8);
-    for (int i = 0; i < np; i++) { float a = pr[i].x - px, b = pr[i].z - pz; if (a * a + b * b < far2 + 600) prop(&pr[i]); }
-    for (int i = 0; i < 5; i++) if (!got[ch][i]) {
-        setT(lanX[i], 0, lanZ[i], t * 2, 1);
-        box(0, .9f + sinf(t * 2 + i) * .12f, 0, .2f, .25f, .2f, RGB(255,200,60)); box(0, 1.25f + sinf(t * 2 + i) * .12f, 0, .1f, .06f, .1f, RGB(90,70,40));
+    float *V = malloc((nv + 1) * 12), *T = malloc((nt + 1) * 8), *N = malloc((nn + 1) * 12);
+    m.v = tvAlloc(tris * 3);
+    if (!V || !T || !N || !m.v) { free(V); free(T); free(N); free(buf); m.n = 0; m.v = 0; return m; }
+    int iv = 0, it = 0, in = 0, k = 0;
+    for (char *p = buf; *p;) {
+        if (p[0] == 'v' && p[1] == ' ') { sscanf(p + 2, "%f %f %f", &V[iv * 3], &V[iv * 3 + 1], &V[iv * 3 + 2]); iv++; }
+        else if (p[0] == 'v' && p[1] == 't') { sscanf(p + 3, "%f %f", &T[it * 2], &T[it * 2 + 1]); it++; }
+        else if (p[0] == 'v' && p[1] == 'n') { sscanf(p + 3, "%f %f %f", &N[in * 3], &N[in * 3 + 1], &N[in * 3 + 2]); in++; }
+        else if (p[0] == 'f' && p[1] == ' ') {
+            int ia[16], ib[16], ic[16], kk = 0; char *q = p + 1;
+            while (kk < 16 && corner(&q, &ia[kk], &ib[kk], &ic[kk])) kk++;
+            for (int t = 1; t + 1 < kk; t++) {
+                int id[3] = {0, t, t + 1};
+                float fn[3] = {0, 1, 0};
+                if (!ic[0] || ic[0] > nn) {
+                    int i0 = ia[0] - 1, i1 = ia[t] - 1, i2 = ia[t + 1] - 1;
+                    if (i0 >= 0 && i1 >= 0 && i2 >= 0 && i0 < iv && i1 < iv && i2 < iv) {
+                        float ux = V[i1*3]-V[i0*3], uy = V[i1*3+1]-V[i0*3+1], uz = V[i1*3+2]-V[i0*3+2], wx = V[i2*3]-V[i0*3], wy = V[i2*3+1]-V[i0*3+1], wz = V[i2*3+2]-V[i0*3+2];
+                        fn[0] = uy*wz - uz*wy; fn[1] = uz*wx - ux*wz; fn[2] = ux*wy - uy*wx;
+                    }
+                }
+                for (int j = 0; j < 3; j++) {
+                    int pi = ia[id[j]] - 1, ti = ib[id[j]] - 1, ni = ic[id[j]] - 1;
+                    TV *o = &m.v[k++];
+                    if (pi < 0 || pi >= iv) pi = 0;
+                    o->x = V[pi*3]; o->y = V[pi*3+1]; o->z = V[pi*3+2];
+                    o->u = (ti >= 0 && ti < it) ? T[ti*2] : 0; o->v = (ti >= 0 && ti < it) ? 1.0f - T[ti*2+1] : 0;
+                    if (ni >= 0 && ni < in) o->c = bake(RGB(255,255,255), N[ni*3], N[ni*3+1], N[ni*3+2]); else o->c = bake(RGB(255,255,255), fn[0], fn[1], fn[2]);
+                }
+            }
+        }
+        while (*p && *p != '\n') p++; if (*p) p++;
     }
-    for (int i = 0; i < NNP; i++) if (NP[i].ch == ch) {
-        drawNPC(&NP[i], t);
-        if (mode == M_PLAY && npcOpen(i) && NP[i].bit >= 0) marker(NP[i].x, NP[i].kind == K_GIANT ? 7.5f : 3.0f, NP[i].z, t);
+    m.n = k; free(V); free(T); free(N); free(buf);
+    return m;
+}
+static Tex loadTGA(const char *path) {
+    Tex t = {0, 0, 0}; FILE *f = fopen(path, "rb"); if (!f) return t;
+    unsigned char h[18]; if (fread(h, 1, 18, f) != 18) { fclose(f); return t; }
+    int w = h[12] | (h[13] << 8), hh = h[14] | (h[15] << 8), bpp = h[16];
+    if (h[2] != 2 || (bpp != 24 && bpp != 32) || w < 4 || hh < 1 || w > 256 || hh > 256 || (w & (w - 1)) || (hh & (hh - 1))) { fclose(f); return t; }
+    fseek(f, h[0], SEEK_CUR);
+    int bp = bpp / 8; unsigned char *px = malloc(w * hh * bp); unsigned *d = memalign(16, w * hh * 4);
+    if (!px || !d || fread(px, 1, w * hh * bp, f) != (size_t)(w * hh * bp)) { free(px); free(d); fclose(f); return t; }
+    fclose(f);
+    for (int y = 0; y < hh; y++) {
+        int sy = (h[17] & 0x20) ? y : hh - 1 - y;
+        for (int x = 0; x < w; x++) { unsigned char *s = px + (sy * w + x) * bp; d[y * w + x] = 0xff000000u | (s[2]) | (s[1] << 8) | ((unsigned)s[0] << 16); }
     }
-    if (mode != M_TITLE) person(px, 0, pz, pyaw, SKA, RGB(60,110,200), RGB(50,50,70), RGB(100,60,30), RGB(20,20,20), walk, 1);
-    else person(0, 0, 4, t, SKA, RGB(60,110,200), RGB(50,50,70), RGB(100,60,30), RGB(20,20,20), t * 3, 1);
+    free(px); t.d = d; t.w = w; t.h = hh;
+    return t;
 }
 
-/* ---------------------------------------------------------------- 2D / text */
-static void rect(int x, int y, int w, int h, unsigned c) {
-    V *v = sceGuGetMemory(2 * sizeof(V));
-    v[0].c = c; v[0].x = (float)x; v[0].y = (float)y; v[0].z = 0;
-    v[1].c = c; v[1].x = (float)(x + w); v[1].y = (float)(y + h); v[1].z = 0;
-    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, v);
-}
-static void ptxt(int c, int r, unsigned col, const char *s) {
-    pspDebugScreenSetTextColor(col); pspDebugScreenSetXY(c, r); pspDebugScreenPuts(s);
-}
-static void wrapPrint(const char *t, int shown, int row, unsigned col) {
-    char line[64]; int pos = 0, len = (int)strlen(t);
-    while (pos < len && row < 29) {
-        int end = pos + 54;
-        if (end >= len) end = len; else { while (end > pos && t[end] != ' ') end--; if (end == pos) end = pos + 54; }
-        int n = end - pos, show = shown - pos;
-        if (show > n) show = n;
-        if (show < 0) show = 0;
-        memcpy(line, t + pos, show); line[show] = 0;
-        ptxt(2, row, col, line);
-        pos = end; while (pos < len && t[pos] == ' ') pos++;
-        row++;
+/* ---- procedural placeholder textures (64x64) ---- */
+static unsigned hsh(int x, int y) { unsigned h = x * 374761393u + y * 668265263u; h = (h ^ (h >> 13)) * 1274126177u; return h ^ (h >> 16); }
+static Tex mkTex(int kind) {
+    Tex t; t.w = t.h = 64; t.d = memalign(16, 64 * 64 * 4);
+    for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+        int n = (int)(hsh(x, y) & 31) - 16, r, g, b;
+        if (kind == 0) { r = 70 + n; g = 115 + n * 2; b = 55 + n; }                                   /* grass */
+        else if (kind == 1) { int e = (x % 32 < 2) || (y % 32 < 2); r = g = b = e ? 70 : 150 + n; b += 5; } /* flagstone */
+        else if (kind == 2) { int e = (y % 16 < 2) || (((x + (y / 16) * 16) % 32) < 2); r = e ? 120 : 205 + n; g = e ? 110 : 190 + n; b = e ? 100 : 160 + n; } /* plaster+brick */
+        else { int wv = ((x ^ y) & 4) ? 6 : -6; r = g = b = 205 + n + wv; }                              /* cloth */
+        t.d[y * 64 + x] = 0xff000000u | (r < 0 ? 0 : r > 255 ? 255 : r) | ((g < 0 ? 0 : g > 255 ? 255 : g) << 8) | ((unsigned)(b < 0 ? 0 : b > 255 ? 255 : b) << 16);
     }
+    return t;
+}
+static void bind(const Tex *t) { sceGuTexImage(0, t->w, t->h, t->w, t->d); }
+
+/* ------------------------------------------------------------ humanoid rig (rigid parts, procedural animation) */
+typedef struct { M torso, head, hair, arm, leg, eye; Tex tex; } Hum;
+static Tex texCloth, texGrass, texStone, texWall, texLevel;
+static M tryObj(const char *pre, const char *part, M fb) { char p[96]; snprintf(p, sizeof p, "assets/%s_%s.obj", pre, part); M m = loadOBJ(p); return m.n ? m : fb; }
+
+static Hum mkHum(const char *pre, unsigned shirt, unsigned pants, unsigned skin, unsigned hair, unsigned eye) {
+    static const float tp[6] = {.2f,.26f,.28f,.33f,.2f,.09f}, ty[6] = {-.05f,.1f,.3f,.55f,.66f,.7f};
+    static const float ap[5] = {.07f,.08f,.065f,.055f,.05f}, ay[5] = {0,-.2f,-.4f,-.6f,-.7f};
+    static const float lp[5] = {.12f,.12f,.09f,.08f,.09f}, ly[5] = {0,-.3f,-.6f,-.82f,-.88f};
+    float hp[5], hy[5]; Hum h; char p[96];
+    for (int i = 0; i < 5; i++) { float t = .15f + (PI / 2 - .15f) * i / 4; hp[i] = .19f * cosf(t); hy[i] = .22f * sinf(t); }
+    h.torso = tryObj(pre, "torso", lathe(tp, ty, 6, 10, 2, 1, shirt));
+    h.head = tryObj(pre, "head", sphere(.17f, 1.2f, 10, skin));
+    h.hair = lathe(hp, hy, 5, 10, 2, 1, hair);
+    h.arm = tryObj(pre, "arm", lathe(ap, ay, 5, 8, 1, 1, shirt));
+    h.leg = tryObj(pre, "leg", lathe(lp, ly, 5, 8, 1, 1, pants));
+    h.eye = sphere(.03f, 1, 6, eye);
+    snprintf(p, sizeof p, "assets/%s.tga", pre); h.tex = loadTGA(p); if (!h.tex.d) h.tex = texCloth;
+    return h;
+}
+enum { A_IDLE, A_WALK, A_ATTACK, A_HURT, A_DIE, A_TALK };
+static void tr(float x, float y, float z) { ScePspFVector3 v = {x, y, z}; sceGumTranslate(&v); }
+static void drawM(const M *m) { if (m->n) sceGumDrawArray(GU_TRIANGLES, TVT, m->n, 0, m->v); }
+static void drawHum(const Hum *h, float x, float y, float z, float yaw, float ph, float spd, int an, float at) {
+    float sw = sinf(ph) * .8f * spd, bob = fabsf(cosf(ph)) * .04f * spd, ra = -sw, la = sw;
+    bind(&h->tex);
+    sceGumMatrixMode(GU_MODEL); sceGumLoadIdentity();
+    tr(x, y + .9f + bob, z); sceGumRotateY(yaw);
+    if (an == A_HURT) sceGumRotateX(-.5f * sinf(at * PI));
+    if (an == A_DIE) { sceGumRotateX(-1.5f * (at > 1 ? 1 : at)); }
+    if (an == A_ATTACK) { float p = at > 1 ? 1 : at; ra = -2.8f + p * 2.2f; }
+    if (an == A_TALK) ra = -1.1f + sinf(at * 6) * .3f;
+    if (an == A_IDLE) { bob = sinf(at * 2) * .01f; }
+    drawM(&h->torso);
+    sceGumPushMatrix(); tr(0, .88f, 0); drawM(&h->head); drawM(&h->hair);
+    sceGumPushMatrix(); tr(-.07f, .03f, .17f); drawM(&h->eye); sceGumPopMatrix();
+    sceGumPushMatrix(); tr(.07f, .03f, .17f); drawM(&h->eye); sceGumPopMatrix(); sceGumPopMatrix();
+    sceGumPushMatrix(); tr(.37f, .58f, 0); sceGumRotateX(ra); drawM(&h->arm); sceGumPopMatrix();
+    sceGumPushMatrix(); tr(-.37f, .58f, 0); sceGumRotateX(la); drawM(&h->arm); sceGumPopMatrix();
+    sceGumPushMatrix(); tr(.13f, 0, 0); sceGumRotateX(la); drawM(&h->leg); sceGumPopMatrix();
+    sceGumPushMatrix(); tr(-.13f, 0, 0); sceGumRotateX(-la); drawM(&h->leg); sceGumPopMatrix();
 }
 
-/* ---------------------------------------------------------------- dialogue engine */
-static const L *dl, *cur; static int di, dn = -1, after, sel; static float dchars;
-static L tmp[2]; static char optA[64], optB[64];
-static int fadeA, fadeDir;
-static const char *endTitle = "";
+/* ------------------------------------------------------------ level: Ashfall town square */
+typedef struct { float x, z, hx, hz, h; unsigned c; } Bd;
+typedef struct { float x, z, r; } Ci;
+static const Bd BLD[] = {
+    {-16,-24,5,4,4,RGB(225,205,170)}, {-4,-25,4,3.5f,5.5f,RGB(200,185,170)}, {12,-24,6,4,4.5f,RGB(215,190,160)},
+    {-27,-6,3.5f,5,4,RGB(210,200,180)}, {27,-4,3.5f,6,5,RGB(220,195,165)},
+    {-14,25,5,3.5f,3.5f,RGB(205,190,165)}, {14,26,5,3.5f,4,RGB(225,200,170)} };
+#define NB ((int)(sizeof(BLD) / sizeof(BLD[0])))
+static const Ci TREE[] = {{-24,12,.6f},{-23,-17,.6f},{24,14,.6f},{22,-19,.6f},{-9,17,.6f},{9,19,.6f},{-25,20,.6f},{25,22,.6f}};
+#define NT ((int)(sizeof(TREE) / sizeof(TREE[0])))
+static const float LAMP[4][2] = {{9,-9},{-9,-9},{-9,9},{9,9}};   /* lamp 0 = checkpoint beside Mara */
+static const float ORB[5][2] = {{-20,18},{21,18},{-21,-14},{20,-14},{0,-18}};
+static const float HOME[3][2] = {{-15,6},{17,8},{-5,-13}};
+#define BOUND 28.0f
 
+static M mBld[NB], mRoof[NB], mTrunk, mLeaf, mPole, mBulb, mFount, mOrb, mGrass, mPlaza, mLevel;
+
+static void buildLevel(void) {
+    static const float trp[3] = {.25f,.17f,.14f}, trh[3] = {0,1.2f,2.6f};
+    static const float lfp[5] = {.02f,.9f,1.5f,1.8f,.3f}, lfy[5] = {5.6f,4.6f,3.5f,2.5f,2.3f};
+    static const float pop[5] = {.22f,.1f,.08f,.08f,.12f}, poy[5] = {0,.4f,1.5f,3.3f,3.45f};
+    static const float fp[8] = {.01f,2.6f,2.6f,2.35f,2.35f,.5f,.35f,.9f}, fy[8] = {.05f,.05f,.75f,.75f,.35f,.35f,1.5f,1.6f};
+    for (int i = 0; i < NB; i++) { mBld[i] = boxM(BLD[i].hx, BLD[i].h / 2, BLD[i].hz, BLD[i].c, 3); mRoof[i] = boxM(BLD[i].hx + .6f, .3f, BLD[i].hz + .6f, RGB(120,60,50), 2); }
+    mTrunk = lathe(trp, trh, 3, 8, 1, 2, RGB(120,85,60)); mLeaf = lathe(lfp, lfy, 5, 9, 3, 2, RGB(70,120,70));
+    mPole = lathe(pop, poy, 5, 8, 1, 3, RGB(80,80,95)); mBulb = sphere(.3f, 1.1f, 8, RGB(255,220,120));
+    mFount = lathe(fp, fy, 8, 14, 4, 2, RGB(150,150,160)); mOrb = sphere(.28f, 1.2f, 8, RGB(150,230,255));
+    mGrass = groundM(70, 30, 0, RGB(255,255,255)); mPlaza = groundM(15, 6, .03f, RGB(255,255,255));
+    mLevel = loadOBJ("assets/level.obj"); texLevel = loadTGA("assets/level.tga");
+}
+
+/* ------------------------------------------------------------ game state */
+typedef struct { float x, z, yaw, ph, t, cd, hurt; int hp, st, alive; } En;
+enum { M_TITLE, M_PLAY, M_SAY, M_CHOOSE, M_PAUSE, M_DEAD };
+enum { Q_TALK, Q_KILL, Q_RETURN, Q_DONE };
+static int mode = M_TITLE, quest, trust, orbs, hasKey, php = 5, orbGot[5], menuSel;
+static float px, pz, pyaw, pph, pspd, inv, pAtk = -1, hurtT, talkT, camYaw, fadeT, ckx = 7.5f, ckz = -5.5f;
+static int hitDone;
+static En en[3];
+static Hum hHero, hMara, hShade;
+static unsigned frames, playF;
+static char msg[64]; static int msgT;
+static float marX = 6.5f, marZ = -7.0f;
+
+static void note(const char *s) { snprintf(msg, sizeof msg, "%s", s); msgT = 90; }
+static int kills(void) { int k = 0; for (int i = 0; i < 3; i++) if (!en[i].alive) k++; return k; }
+
+static void collide(float *x, float *z, float r) {
+    if (*x > BOUND) *x = BOUND; if (*x < -BOUND) *x = -BOUND; if (*z > BOUND) *z = BOUND; if (*z < -BOUND) *z = -BOUND;
+    for (int i = 0; i < NB; i++) {
+        float cx = *x < BLD[i].x - BLD[i].hx ? BLD[i].x - BLD[i].hx : *x > BLD[i].x + BLD[i].hx ? BLD[i].x + BLD[i].hx : *x;
+        float cz = *z < BLD[i].z - BLD[i].hz ? BLD[i].z - BLD[i].hz : *z > BLD[i].z + BLD[i].hz ? BLD[i].z + BLD[i].hz : *z;
+        float dx = *x - cx, dz = *z - cz, d = sqrtf(dx * dx + dz * dz);
+        if (d < r) { if (d > 1e-4f) { *x = cx + dx / d * r; *z = cz + dz / d * r; } else *x += r; }
+    }
+    for (int i = 0; i < NT; i++) { float dx = *x - TREE[i].x, dz = *z - TREE[i].z, d = sqrtf(dx * dx + dz * dz), m = TREE[i].r + r; if (d < m && d > 1e-4f) { *x = TREE[i].x + dx / d * m; *z = TREE[i].z + dz / d * m; } }
+    { float d = sqrtf(*x * *x + *z * *z); if (d < 2.9f + r && d > 1e-4f) { *x = *x / d * (2.9f + r); *z = *z / d * (2.9f + r); } }
+}
+
+/* ---- save / load (checkpoint) ---- */
+typedef struct { int magic, quest, hp, orbs, key, trust; float x, z; int orbGot[5], dead[3]; } SV;
+static int saveGame(void) {
+    SV s; memset(&s, 0, sizeof s); s.magic = 0xA5F1; s.quest = quest; s.hp = php; s.orbs = orbs; s.key = hasKey; s.trust = trust; s.x = ckx; s.z = ckz + 1.5f;
+    for (int i = 0; i < 5; i++) s.orbGot[i] = orbGot[i];
+    for (int i = 0; i < 3; i++) s.dead[i] = !en[i].alive;
+    FILE *f = fopen("save.bin", "wb"); if (!f) return 0; fwrite(&s, sizeof s, 1, f); fclose(f); return 1;
+}
+static void resetEnemies(const int *dead) {
+    for (int i = 0; i < 3; i++) { en[i].x = HOME[i][0]; en[i].z = HOME[i][1]; en[i].yaw = 0; en[i].ph = 0; en[i].t = 0; en[i].cd = 0; en[i].hurt = 0; en[i].hp = 3; en[i].st = 0; en[i].alive = dead ? !dead[i] : 1; }
+}
+static int loadGame(void) {
+    SV s; FILE *f = fopen("save.bin", "rb"); if (!f) return 0;
+    int ok = fread(&s, sizeof s, 1, f) == 1 && s.magic == 0xA5F1; fclose(f); if (!ok) return 0;
+    quest = s.quest; php = s.hp; orbs = s.orbs; hasKey = s.key; trust = s.trust; px = s.x; pz = s.z; pyaw = 3.14f; inv = 0; pAtk = -1;
+    for (int i = 0; i < 5; i++) orbGot[i] = s.orbGot[i];
+    resetEnemies(s.dead); return 1;
+}
+static void newGame(void) {
+    quest = Q_TALK; trust = 0; orbs = 0; hasKey = 0; php = 5; px = 0; pz = 14; pyaw = 3.14f; camYaw = 0; inv = 0; pAtk = -1; playF = 0; memset(orbGot, 0, sizeof orbGot); resetEnemies(0);
+}
+
+/* ---- dialogue ---- */
+typedef struct { const char *s, *t; } L;
+#define E {0,0}
+static const L d_intro[] = {
+{"","Ashfall. A mining town that went quiet the night its lamps began to flicker."},
+{"Kai","The elder's letter said she needs help. Let's find her by the fountain."},
+{"","Stick: walk. L/R: camera. O: run. X: talk / attack. START: pause."},E};
+static const L d_m1[] = {
+{"Mara","You came. I did not think anyone would."},
+{"Kai","Your letter said something was wrong in the square."},
+{"Mara","Shades. Three of them, drifting out of the old mine at dusk. They feed on lamplight."},
+{"Mara","The lamps are all that keeps this town awake."},
+{"*","I'll deal with them.|What's in it for me?"},
+{"Mara","Brave. They hate being looked at, so face them and strike when they lunge."},
+{"Mara","Honest, at least. The key to the old cellar. It opens more than a cellar."},
+{"Mara","Rest at the lamp beside me to save your progress. Then go."},E};
+static const L d_m2[] = {{"Mara","Three shades, Kai. Rest at the lamp if you need to."},E};
+static const L d_m3[] = {
+{"Mara","The square is quiet. You did it."},
+{"Kai","Harder than I expected."},
+{"Mara","Take the Lantern Key. It opens your father's cellar, deep in the old mine."},
+{"","VERTICAL SLICE COMPLETE. The mine is the next location."},E};
+static const L d_m4[] = {{"Mara","The cellar waits in the mine. Another night."},E};
+
+static const L *dl, *cur; static int di, after, sel; static float dchars; static L tmp[2]; static char optA[64], optB[64];
 static void load(void);
-static void startDlg(const L *a, int npc, int aft) { dl = a; di = 0; dn = npc; after = aft; load(); }
-static void one(const char *spk, const char *txt) { tmp[0].s = spk; tmp[0].t = txt; tmp[1].s = 0; tmp[1].t = 0; startDlg(tmp, -1, 0); }
-
+static void startDlg(const L *a, int aft) { dl = a; di = 0; after = aft; load(); }
 static void finishD(void) {
-    int a = after, n = dn;
-    mode = M_PLAY; after = 0; dn = -1;
-    if (n >= 0 && !seen[n]) { seen[n] = 1; if (NP[n].bit >= 0) flags |= 1 << NP[n].bit; if (NP[n].act == 1) shards++; }
-    if (a == 1) { mode = M_FADE; fadeA = 0; fadeDir = 1; }
-    else if (a == 2) {
-        if (lensChoice == 0) { endTitle = "THE SEAL"; startDlg(DL[D_ENDA], -1, 3); }
-        else if (trust >= 2) { endTitle = "THE HARBOR - TRUE ENDING"; startDlg(DL[D_ENDB], -1, 3); }
-        else { endTitle = "THE TIDE RETURNS"; startDlg(DL[D_ENDC], -1, 3); }
-    }
-    else if (a == 3) mode = M_CREDITS;
+    int a = after; after = 0; mode = M_PLAY;
+    if (a == 10) { quest = Q_KILL; note("Objective updated"); saveGame(); }
+    if (a == 11) { quest = Q_DONE; hasKey = 1; note("Received: Lantern Key"); saveGame(); }
 }
-
 static void load(void) {
     cur = &dl[di++];
     if (!cur->s) { finishD(); return; }
     if (cur->s[0] == '*') {
-        const char *bar = strchr(cur->t, '|');
-        int la = (int)(bar - cur->t);
-        memcpy(optA, cur->t, la); optA[la] = 0;
-        strncpy(optB, bar + 1, 63); optB[63] = 0;
-        sel = 0; mode = M_CHOOSE;
+        const char *bar = strchr(cur->t, '|'); int la = (int)(bar - cur->t);
+        memcpy(optA, cur->t, la); optA[la] = 0; strncpy(optB, bar + 1, 63); optB[63] = 0; sel = 0; mode = M_CHOOSE;
     } else { dchars = 0; mode = M_SAY; }
 }
-
-static void talk(int i) {
-    N *n = &NP[i];
-    if ((flags & n->req) != n->req) one("", "Something tells you there is more to learn here first.");
-    else if (seen[i]) one(n->n, n->rep);
-    else startDlg(DL[n->dlg], i, n->dlg == D_LENS ? 2 : 0);
-}
-
-static void newGame(void) {
-    memset(seen, 0, sizeof(seen)); memset(got, 0, sizeof(got));
-    ch = 0; flags = 0; shards = 0; trust = 0; lensChoice = 0; playF = 0;
-    px = 0; pz = 6; pyaw = 3.14f; cam = 0; gen(0);
-    startDlg(DL[CH[0].intro], -1, 0);
-}
-
-static void nextChapter(void) {
-    ch++; flags = 0; px = 0; pz = 8; pyaw = 3.14f; cam = 0; gen(ch);
-}
-
-static void update(const SceCtrlData *p, unsigned pr_) {
-    if (mode == M_TITLE) { if (pr_ & (PSP_CTRL_CROSS | PSP_CTRL_START)) newGame(); return; }
-    if (mode == M_CREDITS) { if (pr_ & PSP_CTRL_START) { mode = M_TITLE; ch = 0; gen(0); } return; }
-    if (mode == M_FADE) {
-        fadeA += 6 * fadeDir;
-        if (fadeA >= 255) { fadeA = 255; fadeDir = -1; nextChapter(); }
-        if (fadeA <= 0 && fadeDir < 0) { fadeA = 0; mode = M_PLAY; startDlg(DL[CH[ch].intro], -1, 0); }
-        return;
+static const char *objective(void) {
+    switch (quest) {
+    case Q_TALK: return "Talk to Mara by the fountain.";
+    case Q_KILL: { static char b[48]; snprintf(b, sizeof b, "Defeat the shades (%d/3).", kills()); return b; }
+    case Q_RETURN: return "Return to Mara.";
+    default: return "Slice complete. Hunt the memory orbs.";
     }
-    playF++;
-    if (mode == M_SAY) {
-        int len = (int)strlen(cur->t);
-        dchars += .8f;
-        if (pr_ & PSP_CTRL_CROSS) { if (dchars < len) dchars = (float)len; else load(); }
-        return;
+}
+
+/* ------------------------------------------------------------ update */
+static float dist(float ax, float az, float bx, float bz) { float a = ax - bx, b = az - bz; return sqrtf(a * a + b * b); }
+
+static void hurtPlayer(float fx, float fz) {
+    if (inv > 0 || php <= 0) return;
+    php--; inv = 1.4f; hurtT = .4f;
+    float d = dist(px, pz, fx, fz); if (d > .01f) { px += (px - fx) / d * 1.2f; pz += (pz - fz) / d * 1.2f; collide(&px, &pz, .5f); }
+    if (php <= 0) { mode = M_DEAD; fadeT = 0; }
+}
+
+static void updateEnemies(void) {
+    for (int i = 0; i < 3; i++) {
+        En *e = &en[i]; float d = dist(e->x, e->z, px, pz), sp = 0;
+        e->t += DT;
+        if (!e->alive) continue;
+        if (e->hurt > 0) { e->hurt -= DT; continue; }
+        if (e->cd > 0) e->cd -= DT;
+        if (e->st == 2) {                                   /* wind-up, then strike */
+            e->yaw = atan2f(px - e->x, pz - e->z);
+            if (e->t > .6f) { if (d < 2.1f) hurtPlayer(e->x, e->z); e->st = 0; e->cd = 1.4f; e->t = 0; }
+            continue;
+        }
+        if (d < 11 && php > 0) { e->st = 1; e->yaw = atan2f(px - e->x, pz - e->z); sp = 2.6f; if (d < 1.7f) { sp = 0; if (e->cd <= 0) { e->st = 2; e->t = 0; } } }
+        else { e->st = 0; float hx = HOME[i][0] - e->x, hz = HOME[i][1] - e->z, hd = sqrtf(hx * hx + hz * hz); if (hd > 2) { e->yaw = atan2f(hx, hz); sp = 1.2f; } }
+        e->x += sinf(e->yaw) * sp * DT; e->z += cosf(e->yaw) * sp * DT; collide(&e->x, &e->z, .5f);
+        e->ph += sp * DT * 3.2f;
     }
-    if (mode == M_CHOOSE) {
-        if (pr_ & (PSP_CTRL_UP | PSP_CTRL_DOWN)) sel = !sel;
-        if (pr_ & PSP_CTRL_CROSS) {
-            const L *base = cur; int ch2 = sel;
-            if (dl == d_lens) lensChoice = sel; else if (sel == 0) trust++;
-            cur = base + 1 + ch2;
-            di += 2; dchars = 0; mode = M_SAY;
+}
+
+static void playerAttackHit(void) {
+    for (int i = 0; i < 3; i++) {
+        En *e = &en[i]; if (!e->alive) continue;
+        float d = dist(px, pz, e->x, e->z); if (d > 2.5f) continue;
+        float ang = atan2f(e->x - px, e->z - pz) - pyaw; while (ang > PI) ang -= 2 * PI; while (ang < -PI) ang += 2 * PI;
+        if (fabsf(ang) > 1.1f) continue;
+        e->hp--; e->hurt = .35f; e->t = 0; e->st = 0;
+        if (d > .01f) { e->x += (e->x - px) / d * .8f; e->z += (e->z - pz) / d * .8f; collide(&e->x, &e->z, .5f); }
+        if (e->hp <= 0) { e->alive = 0; e->t = 0; note("Shade defeated"); }
+    }
+}
+
+static void update(const SceCtrlData *p, unsigned pr) {
+    frames++;
+    if (msgT > 0) msgT--;
+    if (mode == M_TITLE) {
+        camYaw += .01f;
+        if (pr & (PSP_CTRL_UP | PSP_CTRL_DOWN)) menuSel = !menuSel;
+        if (pr & PSP_CTRL_CROSS) {
+            if (menuSel == 1 && loadGame()) { mode = M_PLAY; }
+            else { newGame(); startDlg(d_intro, 0); }
         }
         return;
     }
-    /* M_PLAY */
+    if (mode == M_DEAD) { fadeT += DT; if (fadeT > 1.5f && (pr & PSP_CTRL_CROSS)) { if (!loadGame()) newGame(); mode = M_PLAY; } return; }
+    playF++;
+    if (mode == M_SAY) {
+        int len = (int)strlen(cur->t); dchars += 1.2f; talkT += DT;
+        if (pr & PSP_CTRL_CROSS) { if (dchars < len) dchars = (float)len; else load(); }
+        return;
+    }
+    if (mode == M_CHOOSE) {
+        if (pr & (PSP_CTRL_UP | PSP_CTRL_DOWN)) sel = !sel;
+        if (pr & PSP_CTRL_CROSS) { if (sel == 0) trust++; cur = cur + 1 + sel; di += 2; dchars = 0; mode = M_SAY; }
+        return;
+    }
+    if (mode == M_PAUSE) {
+        if (pr & PSP_CTRL_UP) menuSel = (menuSel + 3) % 4;
+        if (pr & PSP_CTRL_DOWN) menuSel = (menuSel + 1) % 4;
+        if (pr & PSP_CTRL_START) mode = M_PLAY;
+        if (pr & PSP_CTRL_CROSS) {
+            if (menuSel == 0) mode = M_PLAY;
+            else if (menuSel == 1) note(saveGame() ? "Game saved" : "Save failed");
+            else if (menuSel == 2) { if (loadGame()) { mode = M_PLAY; note("Game loaded"); } else note("No save found"); }
+            else { mode = M_TITLE; menuSel = 0; }
+        }
+        return;
+    }
+    /* ---- M_PLAY ---- */
+    if (pr & PSP_CTRL_START) { mode = M_PAUSE; menuSel = 0; return; }
+    if (inv > 0) inv -= DT; if (hurtT > 0) hurtT -= DT;
     float dx = (p->Lx - 128) / 128.0f, dz = (p->Ly - 128) / 128.0f;
-    if (fabsf(dx) < .25f) dx = 0;
-    if (fabsf(dz) < .25f) dz = 0;
-    if (p->Buttons & PSP_CTRL_LEFT) dx = -1;
-    if (p->Buttons & PSP_CTRL_RIGHT) dx = 1;
-    if (p->Buttons & PSP_CTRL_UP) dz = -1;
-    if (p->Buttons & PSP_CTRL_DOWN) dz = 1;
-    if (p->Buttons & PSP_CTRL_LTRIGGER) cam -= .04f;
-    if (p->Buttons & PSP_CTRL_RTRIGGER) cam += .04f;
-    float fx = -sinf(cam), fz = -cosf(cam), rx = cosf(cam), rz = -sinf(cam);
+    if (fabsf(dx) < .25f) dx = 0; if (fabsf(dz) < .25f) dz = 0;
+    if (p->Buttons & PSP_CTRL_LEFT) dx = -1; if (p->Buttons & PSP_CTRL_RIGHT) dx = 1;
+    if (p->Buttons & PSP_CTRL_UP) dz = -1; if (p->Buttons & PSP_CTRL_DOWN) dz = 1;
+    if (p->Buttons & PSP_CTRL_LTRIGGER) camYaw -= 1.6f * DT; if (p->Buttons & PSP_CTRL_RTRIGGER) camYaw += 1.6f * DT;
+    float fx = -sinf(camYaw), fz = -cosf(camYaw), rx = cosf(camYaw), rz = -sinf(camYaw);
     float mx = -fx * dz + rx * dx, mz = -fz * dz + rz * dx, m = sqrtf(mx * mx + mz * mz);
-    if (m > .01f) {
-        float sp = (p->Buttons & PSP_CTRL_CIRCLE) ? .22f : .12f;
-        if (m > 1) { mx /= m; mz /= m; }
-        px += mx * sp; pz += mz * sp; pyaw = atan2f(mx, mz); walk += sp * 3;
+    pspd = 0;
+    if (m > .01f && pAtk < 0) {
+        if (m > 1) { mx /= m; mz /= m; m = 1; }
+        float sp = ((p->Buttons & PSP_CTRL_CIRCLE) ? 7.5f : 4.5f) * m * DT;
+        px += mx * sp; pz += mz * sp; pyaw = atan2f(mx, mz); pspd = (p->Buttons & PSP_CTRL_CIRCLE) ? 1.4f : 1.0f; pph += sp * 2.2f;
     }
-    float b = SC[ch].b; if (px > b) px = b; if (px < -b) px = -b; if (pz > b) pz = b; if (pz < -b) pz = -b;
-    for (int i = 0; i < np; i++) if (pr[i].t != 5) {
-        float a = px - pr[i].x, c = pz - pr[i].z, d = sqrtf(a * a + c * c), mm = pr[i].r + .6f;
-        if (d < mm && d > .001f) { px = pr[i].x + a / d * mm; pz = pr[i].z + c / d * mm; }
+    collide(&px, &pz, .5f);
+    for (int i = 0; i < 5; i++) if (!orbGot[i] && dist(px, pz, ORB[i][0], ORB[i][1]) < 1.4f) { orbGot[i] = 1; orbs++; char b[40]; snprintf(b, sizeof b, "Memory orb %d/5", orbs); note(b); }
+    if (pAtk >= 0) {
+        pAtk += DT; if (pAtk > .15f && !hitDone) { hitDone = 1; playerAttackHit(); } if (pAtk > .5f) pAtk = -1;
     }
-    int near = -1; float best = 3.0f;
-    for (int i = 0; i < NNP; i++) if (NP[i].ch == ch) {
-        float a = px - NP[i].x, c = pz - NP[i].z, d = sqrtf(a * a + c * c), rad = NP[i].kind == K_GIANT ? 2.6f : .8f;
-        if (d < rad && d > .001f) { px = NP[i].x + a / d * rad; pz = NP[i].z + c / d * rad; }
-        if (NP[i].kind == K_GIANT) d -= 2.2f;
-        if (d < best) { best = d; near = i; }
+    int nearMara = dist(px, pz, marX, marZ) < 2.8f, nearLamp = dist(px, pz, ckx, ckz) < 2.6f;
+    if (pr & PSP_CTRL_CROSS) {
+        if (nearMara) {
+            if (quest == Q_TALK) startDlg(d_m1, 10); else if (quest == Q_KILL) startDlg(d_m2, 0); else if (quest == Q_RETURN) startDlg(d_m3, 11); else startDlg(d_m4, 0);
+            return;
+        }
+        if (nearLamp) { php = 5; note(saveGame() ? "Checkpoint saved. Health restored." : "Save failed"); }
+        else if (pAtk < 0) { pAtk = 0; hitDone = 0; }
     }
-    for (int i = 0; i < 5; i++) if (!got[ch][i]) { float a = px - lanX[i], c = pz - lanZ[i]; if (a * a + c * c < 2.0f) got[ch][i] = 1; }
-    if (near >= 0 && (pr_ & PSP_CTRL_CROSS)) { talk(near); return; }
-    if (ch < 4 && (flags & CH[ch].mask) == CH[ch].mask && lantCount(ch) >= 3) startDlg(DL[CH[ch].outro], -1, 1);
+    updateEnemies();
+    if (quest == Q_KILL && kills() >= 3) { quest = Q_RETURN; note("All shades defeated"); saveGame(); }
 }
 
-static int nearIdx(void) {
-    int near = -1; float best = 3.0f;
-    for (int i = 0; i < NNP; i++) if (NP[i].ch == ch) {
-        float a = px - NP[i].x, c = pz - NP[i].z, d = sqrtf(a * a + c * c);
-        if (NP[i].kind == K_GIANT) d -= 2.2f;
-        if (d < best) { best = d; near = i; }
-    }
-    return near;
-}
-
-/* ---------------------------------------------------------------- render */
+/* ------------------------------------------------------------ render */
 static int drawOff = 0;
+typedef struct { unsigned c; float x, y, z; } CV;
+static void rect(int x, int y, int w, int h, unsigned c) {
+    CV *v = sceGuGetMemory(2 * sizeof(CV));
+    v[0].c = c; v[0].x = (float)x; v[0].y = (float)y; v[0].z = 0; v[1].c = c; v[1].x = (float)(x + w); v[1].y = (float)(y + h); v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2, 0, v);
+}
+static void ptxt(int c, int r, unsigned col, const char *s) { pspDebugScreenSetTextColor(col); pspDebugScreenSetXY(c, r); pspDebugScreenPuts(s); }
+static void wrapPrint(const char *t, int shown, int row, unsigned col) {
+    char line[64]; int pos = 0, len = (int)strlen(t);
+    while (pos < len && row < 29) {
+        int end = pos + 54; if (end >= len) end = len; else { while (end > pos && t[end] != ' ') end--; if (end == pos) end = pos + 54; }
+        int n = end - pos, show = shown - pos; if (show > n) show = n; if (show < 0) show = 0;
+        memcpy(line, t + pos, show); line[show] = 0; ptxt(2, row, col, line);
+        pos = end; while (pos < len && t[pos] == ' ') pos++; row++;
+    }
+}
+static void place(float x, float y, float z, float yaw) { sceGumMatrixMode(GU_MODEL); sceGumLoadIdentity(); tr(x, y, z); if (yaw) sceGumRotateY(yaw); }
+
+static void enemyAnim(const En *e, int *an, float *at) {
+    if (!e->alive) { *an = A_DIE; *at = e->t / .8f; return; }
+    if (e->hurt > 0) { *an = A_HURT; *at = 1 - e->hurt / .35f; return; }
+    if (e->st == 2) { *an = A_ATTACK; *at = e->t / .6f; return; }
+    *an = A_WALK; *at = e->t;
+}
+
+static void world(float t) {
+    float far2 = 70.0f * 70.0f;
+    sceGuEnable(GU_TEXTURE_2D);
+    bind(&texGrass); place(0, 0, 0, 0); drawM(&mGrass);
+    if (mLevel.n) { bind(texLevel.d ? &texLevel : &texWall); place(0, 0, 0, 0); drawM(&mLevel); }
+    else {
+        bind(&texStone); place(0, 0, 0, 0); drawM(&mPlaza); drawM(&mFount);
+        for (int i = 0; i < NB; i++) {
+            if (dist(px, pz, BLD[i].x, BLD[i].z) * 1 > 70) continue;
+            bind(&texWall); place(BLD[i].x, 0, BLD[i].z, 0); drawM(&mBld[i]);
+            bind(&texCloth); place(BLD[i].x, BLD[i].h, BLD[i].z, 0); drawM(&mRoof[i]);
+        }
+    }
+    bind(&texCloth);
+    for (int i = 0; i < NT; i++) { if (dist(px, pz, TREE[i].x, TREE[i].z) > 60) continue; place(TREE[i].x, 0, TREE[i].z, i * 1.3f); drawM(&mTrunk); drawM(&mLeaf); }
+    for (int i = 0; i < 4; i++) { place(LAMP[i][0], 0, LAMP[i][1], 0); drawM(&mPole); sceGumPushMatrix(); tr(0, 3.65f, 0); drawM(&mBulb); sceGumPopMatrix(); }
+    for (int i = 0; i < 5; i++) if (!orbGot[i]) { place(ORB[i][0], 1.0f + sinf(t * 2 + i) * .2f, ORB[i][1], t * 2); drawM(&mOrb); }
+    (void)far2;
+    place(0, 0, 0, 0);
+    drawHum(&hMara, marX, 0, marZ, atan2f(px - marX, pz - marZ), 0, 0, (mode == M_SAY || mode == M_CHOOSE) ? A_TALK : A_IDLE, (mode == M_SAY) ? talkT : t);
+    for (int i = 0; i < 3; i++) {
+        const En *e = &en[i]; int an; float at; if (!e->alive && e->t > 3) continue;
+        enemyAnim(e, &an, &at); drawHum(&hShade, e->x, 0, e->z, e->yaw, e->ph, e->st == 1 ? 1.2f : (e->st == 0 ? .6f : 0), an, at);
+    }
+    if (mode == M_TITLE) drawHum(&hHero, 0, 0, 8, t, 0, 0, A_IDLE, t);
+    else if (inv <= 0 || ((int)(t * 12) & 1)) {
+        int an = A_IDLE; float at = t;
+        if (pAtk >= 0) { an = A_ATTACK; at = pAtk / .5f; } else if (hurtT > 0) { an = A_HURT; at = 1 - hurtT / .4f; } else if (pspd > 0) { an = A_WALK; at = t; }
+        drawHum(&hHero, px, 0, pz, pyaw, pph, pspd, an, at);
+    }
+}
 
 static void render(float t) {
-    const S *s = &SC[ch];
     char buf[96];
     sceGuStart(GU_DIRECT, list);
-    sceGuClearColor(mode == M_CREDITS ? 0xff000000u : s->sky); sceGuClearDepth(0);
-    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
-    sceGuEnable(GU_DEPTH_TEST); sceGuDisable(GU_BLEND); sceGuEnable(GU_FOG); sceGuFog(8.0f, s->fog, s->sky);
-    sceGumMatrixMode(GU_PROJECTION); sceGumLoadIdentity(); sceGumPerspective(55.0f, 16.0f / 9.0f, 0.5f, 140.0f);
-    float ca = (mode == M_TITLE) ? t * .3f : cam, dist = (mode == M_TITLE) ? 11.0f : 9.0f, tx = (mode == M_TITLE) ? 0 : px, tz = (mode == M_TITLE) ? 4 : pz;
-    ScePspFVector3 eye = { tx + sinf(ca) * dist, 5.5f, tz + cosf(ca) * dist }, ctr = { tx, 1.6f, tz }, up = { 0, 1, 0 };
+    sceGuClearColor(SKY); sceGuClearDepth(0); sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+    sceGuEnable(GU_DEPTH_TEST); sceGuDisable(GU_BLEND); sceGuEnable(GU_FOG); sceGuFog(14.0f, 58.0f, SKY);
+    sceGumMatrixMode(GU_PROJECTION); sceGumLoadIdentity(); sceGumPerspective(55.0f, 16.0f / 9.0f, 0.5f, 90.0f);
+    float tx = mode == M_TITLE ? 0 : px, tz = mode == M_TITLE ? 8 : pz, dist_ = mode == M_TITLE ? 5.5f : 8.0f;
+    ScePspFVector3 eye = {tx + sinf(camYaw) * dist_, mode == M_TITLE ? 2.2f : 4.6f, tz + cosf(camYaw) * dist_}, ctr = {tx, 1.5f, tz}, up = {0, 1, 0};
     sceGumMatrixMode(GU_VIEW); sceGumLoadIdentity(); sceGumLookAt(&eye, &ctr, &up);
-    sceGumMatrixMode(GU_MODEL); sceGumLoadIdentity();
-    if (mode != M_CREDITS) world(t);
+    world(t);
 
-    sceGuDisable(GU_DEPTH_TEST); sceGuDisable(GU_FOG); sceGuEnable(GU_BLEND);
+    sceGuDisable(GU_TEXTURE_2D); sceGuDisable(GU_DEPTH_TEST); sceGuDisable(GU_FOG); sceGuEnable(GU_BLEND);
     sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
-    if (mode == M_TITLE) rect(50, 70, 380, 100, RGBA(0,0,0,170));
-    if (mode == M_PLAY || mode == M_SAY || mode == M_CHOOSE) rect(0, 0, 480, 18, RGBA(0,0,0,150));
+    int nearMara = 0, nearLamp = 0;
+    if (mode == M_PLAY) { nearMara = dist(px, pz, marX, marZ) < 2.8f; nearLamp = dist(px, pz, ckx, ckz) < 2.6f; }
+    if (mode != M_TITLE) {
+        rect(0, 0, 480, 34, RGBA(0,0,0,150));
+        for (int i = 0; i < 5; i++) rect(8 + i * 16, 20, 12, 10, i < php ? RGBA(230,60,70,255) : RGBA(80,40,50,255));
+    } else rect(110, 150, 260, 60, RGBA(0,0,0,170));
     if (mode == M_SAY || mode == M_CHOOSE) {
         rect(6, 172, 468, 94, RGBA(10,10,30,215)); rect(6, 172, 468, 2, RGBA(255,255,255,200));
         if (cur->s[0] && cur->s[0] != '*') rect(10, 158, (int)strlen(cur->s) * 8 + 12, 16, RGBA(40,40,90,230));
     }
-    int ni = (mode == M_PLAY) ? nearIdx() : -1;
-    if (ni >= 0) rect(120, 236, 240, 16, RGBA(0,0,0,170));
-    if (mode == M_FADE) rect(0, 0, 480, 272, RGBA(0,0,0,fadeA));
+    if (mode == M_PAUSE) rect(100, 40, 280, 190, RGBA(10,10,30,225));
+    if (mode == M_DEAD) rect(0, 0, 480, 272, RGBA(0,0,0, fadeT > 1 ? 220 : (int)(fadeT * 220)));
+    if (mode == M_PLAY && (nearMara || nearLamp)) rect(110, 236, 260, 16, RGBA(0,0,0,170));
     sceGuFinish(); sceGuSync(0, 0);
 
     pspDebugScreenSetOffset(drawOff);
     if (mode == M_TITLE) {
-        ptxt(10, 10, 0xffffffff, "E C H O E S   O F   H O L L O W   B A Y");
-        ptxt(14, 12, 0xff88ddff, "A story adventure for PSP");
-        ptxt(13, 14, 0xffcccccc, "Press X or START to begin");
-        ptxt(8, 16, 0xff999999, "Walk, talk, find lanterns. Your choices matter.");
-    } else if (mode == M_CREDITS) {
-        snprintf(buf, sizeof(buf), "ENDING: %s", endTitle); ptxt(6, 8, 0xff88ddff, buf);
-        snprintf(buf, sizeof(buf), "Play time: %u min", playF / 3600); ptxt(6, 11, 0xffffffff, buf);
-        snprintf(buf, sizeof(buf), "Memory lanterns found: %d / 25", lantTotal()); ptxt(6, 13, 0xffffffff, buf);
-        snprintf(buf, sizeof(buf), "Kindness: %d / 3", trust); ptxt(6, 15, 0xffffffff, buf);
-        ptxt(6, 18, 0xffcccccc, "Thanks for playing ECHOES OF HOLLOW BAY.");
-        ptxt(6, 20, 0xff999999, "Press START to return to the title.");
-    } else if (mode != M_FADE) {
-        snprintf(buf, sizeof(buf), "%s  Shards %d/3  Lanterns %d/5%s", CH[ch].t, shards, lantCount(ch), ch < 4 ? " (need 3)" : "");
-        ptxt(1, 0, 0xffffffff, buf); ptxt(1, 1, 0xff88ddff, CH[ch].goal);
-        if (ni >= 0) {
-            snprintf(buf, sizeof(buf), "X: %s %s", (NP[ni].kind == K_SHARD || NP[ni].kind == K_BOOK) ? "Examine" : "Talk to", NP[ni].n);
-            ptxt(16, 30, 0xff66ffff, buf);
-        }
+        ptxt(17, 3, 0xffffffff, "A S H F A L L"); ptxt(11, 5, 0xff88ddff, "PSP 3D story adventure - vertical slice");
+        ptxt(16, 20, menuSel == 0 ? 0xff55ffff : 0xff999999, "New Game"); ptxt(16, 22, menuSel == 1 ? 0xff55ffff : 0xff999999, "Continue");
+    } else if (mode != M_DEAD) {
+        ptxt(1, 0, 0xff88ddff, objective());
+        snprintf(buf, sizeof buf, "Orbs %d/5%s", orbs, hasKey ? "  Key: Lantern" : ""); ptxt(1, 1, 0xffffffff, buf);
+        if (msgT > 0) ptxt(2, 5, 0xff66ffff, msg);
+        if (nearMara) ptxt(17, 30, 0xff66ffff, "X: Talk to Mara"); else if (nearLamp) ptxt(14, 30, 0xff66ffff, "X: Rest at lamp (save)");
         if (mode == M_SAY || mode == M_CHOOSE) {
-            unsigned c = 0xffe6e6e6; const char *sp = cur->s;
+            const char *sp = cur->s;
             if (mode == M_CHOOSE) {
                 ptxt(2, 23, 0xffcccccc, "Choose:");
                 ptxt(2, 25, sel == 0 ? 0xff55ffff : 0xff999999, sel == 0 ? "> " : "  "); ptxt(4, 25, sel == 0 ? 0xff55ffff : 0xff999999, optA);
                 ptxt(2, 27, sel == 1 ? 0xff55ffff : 0xff999999, sel == 1 ? "> " : "  "); ptxt(4, 27, sel == 1 ? 0xff55ffff : 0xff999999, optB);
             } else {
-                if (sp[0]) {
-                    ptxt(2, 20, !strcmp(sp, "Kai") ? 0xffffd296 : !strcmp(sp, "Warden") ? 0xffffff78 : 0xff96dcff, sp);
-                    c = 0xffffffff;
-                }
-                wrapPrint(cur->t, (int)dchars, 23, c);
+                if (sp[0]) ptxt(2, 20, !strcmp(sp, "Kai") ? 0xffffd296 : 0xff96dcff, sp);
+                wrapPrint(cur->t, (int)dchars, 23, sp[0] ? 0xffffffff : 0xffe0e0e0);
                 if (dchars >= (float)strlen(cur->t)) ptxt(56, 31, 0xffaaaaaa, "[X]");
             }
         }
+        if (mode == M_PAUSE) {
+            ptxt(25, 7, 0xffffffff, "PAUSED");
+            static const char *it[4] = {"Resume", "Save", "Load", "Quit to title"};
+            for (int i = 0; i < 4; i++) ptxt(16, 9 + i, menuSel == i ? 0xff55ffff : 0xff999999, it[i]);
+            snprintf(buf, sizeof buf, "Objective: %s", objective()); ptxt(14, 15, 0xff88ddff, buf);
+            snprintf(buf, sizeof buf, "Health %d/5   Orbs %d/5", php, orbs); ptxt(14, 17, 0xffffffff, buf);
+            ptxt(14, 19, 0xffffffff, "Inventory:"); ptxt(16, 20, 0xffcccccc, hasKey ? "- Lantern Key" : "- (empty)");
+            snprintf(buf, sizeof buf, "Play time: %u min", playF / 1800); ptxt(14, 23, 0xff999999, buf);
+        }
+    } else {
+        ptxt(20, 14, 0xff6666ff, "YOU FELL"); if (fadeT > 1.5f) ptxt(14, 17, 0xffcccccc, "X: return to last checkpoint");
     }
     drawOff = drawOff ? 0 : FS;
     sceGuSwapBuffers();
-    sceDisplayWaitVblankStart();
+    sceDisplayWaitVblankStart(); sceDisplayWaitVblankStart();   /* lock to 30 FPS */
 }
 
 static void initGu(void) {
     sceGuInit(); sceGuStart(GU_DIRECT, list);
-    sceGuDrawBuffer(GU_PSM_8888, (void *)0, BW);
-    sceGuDispBuffer(SW, SH, (void *)FS, BW);
-    sceGuDepthBuffer((void *)(FS * 2), BW);
-    sceGuOffset(2048 - (SW / 2), 2048 - (SH / 2));
-    sceGuViewport(2048, 2048, SW, SH);
-    sceGuDepthRange(65535, 0);
-    sceGuScissor(0, 0, SW, SH); sceGuEnable(GU_SCISSOR_TEST);
-    sceGuDepthFunc(GU_GEQUAL); sceGuEnable(GU_DEPTH_TEST);
-    sceGuFrontFace(GU_CW); sceGuShadeModel(GU_SMOOTH); sceGuDisable(GU_CULL_FACE); sceGuDisable(GU_TEXTURE_2D);
+    sceGuDrawBuffer(GU_PSM_8888, (void *)0, BW); sceGuDispBuffer(SW, SH, (void *)FS, BW); sceGuDepthBuffer((void *)(FS * 2), BW);
+    sceGuOffset(2048 - (SW / 2), 2048 - (SH / 2)); sceGuViewport(2048, 2048, SW, SH); sceGuDepthRange(65535, 0);
+    sceGuScissor(0, 0, SW, SH); sceGuEnable(GU_SCISSOR_TEST); sceGuDepthFunc(GU_GEQUAL); sceGuEnable(GU_DEPTH_TEST);
+    sceGuFrontFace(GU_CW); sceGuShadeModel(GU_SMOOTH); sceGuDisable(GU_CULL_FACE);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0); sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGB); sceGuTexFilter(GU_LINEAR, GU_LINEAR); sceGuTexWrap(GU_REPEAT, GU_REPEAT);
     sceGuFinish(); sceGuSync(0, 0); sceDisplayWaitVblankStart(); sceGuDisplay(GU_TRUE);
 }
 
 int main(void) {
-    int th = sceKernelCreateThread("cb", cbThread, 0x11, 0xFA0, 0, 0);
-    if (th >= 0) sceKernelStartThread(th, 0, 0);
-    pspDebugScreenInit();
-    pspDebugScreenEnableBackColor(0);
+    int th = sceKernelCreateThread("cb", cbThread, 0x11, 0xFA0, 0, 0); if (th >= 0) sceKernelStartThread(th, 0, 0);
+    pspDebugScreenInit(); pspDebugScreenEnableBackColor(0);
     sceCtrlSetSamplingCycle(0); sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
-    initGu(); gen(0);
-    SceCtrlData pad; unsigned old = 0, frame = 0;
+    arena = memalign(16, ARENA * sizeof(TV));
+    texCloth = mkTex(3); texGrass = mkTex(0); texStone = mkTex(1); texWall = mkTex(2);
+    buildLevel();
+    hHero = mkHum("hero", RGB(70,120,210), RGB(60,60,80), RGB(235,190,160), RGB(110,70,40), RGB(20,20,20));
+    hMara = mkHum("mara", RGB(170,70,70), RGB(70,55,55), RGB(225,185,155), RGB(210,210,215), RGB(20,20,20));
+    hShade = mkHum("shade", RGB(70,50,110), RGB(50,35,80), RGB(90,80,120), RGB(40,30,60), RGB(255,60,60));
+    sceKernelDcacheWritebackAll();
+    initGu(); newGame(); mode = M_TITLE;
+    SceCtrlData pad; unsigned old = 0;
     while (running) {
         sceCtrlPeekBufferPositive(&pad, 1);
-        unsigned pressed = pad.Buttons & ~old; old = pad.Buttons; frame++;
-        update(&pad, pressed);
-        render(frame / 60.0f);
+        unsigned pressed = pad.Buttons & ~old; old = pad.Buttons;
+        update(&pad, pressed); render(frames * DT);
     }
     sceGuTerm(); sceKernelExitGame();
     return 0;
 }
+
+/* ASSETS (optional, picked up automatically; power-of-two TGA <= 256, uncompressed 24/32-bit):
+ *   assets/level.obj + assets/level.tga           whole location as one mesh (replaces buildings/plaza)
+ *   assets/hero_torso.obj / _head / _arm / _leg   per-character rigid parts (same for mara_*, shade_*)
+ *   assets/hero.tga, mara.tga, shade.tga          character textures
+ * Export OBJ with normals + UVs, triangulated, ~2-4k tris per location chunk, ~500-800 per character.
+ */
