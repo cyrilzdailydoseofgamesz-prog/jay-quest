@@ -1,0 +1,63 @@
+name: Build Ashfall PSP
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build PSP EBOOT
+    runs-on: ubuntu-latest
+
+    # Official PSPDEV container with the PSP toolchain/SDK.
+    container:
+      image: ghcr.io/pspdev/pspdev:latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Check PSP toolchain
+        run: |
+          echo "PSPDEV=$PSPDEV"
+          echo "PSPSDK=$PSPSDK"
+          psp-gcc --version
+          make --version
+
+      - name: Generate 3D assets
+        run: |
+          if [ -f tools/gen_assets.py ]; then
+            python3 tools/gen_assets.py
+          else
+            echo "tools/gen_assets.py not found"
+            exit 1
+          fi
+
+      - name: Check generated assets
+        run: |
+          echo "Assets:"
+          find assets -maxdepth 1 -type f -print | sort
+
+      - name: Build Ashfall
+        run: |
+          make clean || true
+          make
+
+      - name: Show build output
+        run: |
+          echo "Build directory:"
+          ls -lah
+          echo "EBOOT.PBP:"
+          ls -lh EBOOT.PBP
+
+      - name: Upload PSP game
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ashfall-PSP
+          path: |
+            EBOOT.PBP
+            assets/
+          if-no-files-found: error
+          retention-days: 30
